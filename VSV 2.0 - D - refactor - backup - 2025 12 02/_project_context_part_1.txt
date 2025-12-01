@@ -1,0 +1,1539 @@
+// PART 1 //
+
+PROJECT STRUCTURE:
+- core\__init__.py
+- core\config_manager.py
+- core\engine.py
+- core\locales.py
+- core\state_manager.py
+- download_lib.py
+- main.py
+- modules\career\career_widget.py
+- modules\charts\chart_widget.py
+- modules\charts\indicators.py
+- modules\dashboard\grid_container.py
+- modules\dashboard\grid_widget.py
+- modules\dashboard\strategies.py
+- modules\dashboard\tooltip.py
+- modules\navigation\browser_tabs.py
+- modules\navigation\sidebar.py
+- modules\right_panel\analyst_tabs.py
+- modules\right_panel\ongoing.py
+- modules\session\session_list.py
+- modules\session\session_manager.py
+- modules\session\session_report.py
+- styles.py
+
+==================================================
+
+--- START OF FILE: core\__init__.py ---
+
+--- END OF FILE: core\__init__.py ---
+
+--- START OF FILE: core\config_manager.py ---
+import json
+from pathlib import Path
+
+class ConfigManager:
+    def __init__(self):
+        self.config_path = Path.home() / '.kovaaks_stats_viewer' / "v2_config.json"
+        self.settings = self._load_settings()
+
+    def _load_settings(self):
+        if not self.config_path.exists():
+            return {"global": {}, "scenarios": {}, "favorites": []}
+        try:
+            with open(self.config_path, 'r') as f:
+                data = json.load(f)
+                if "favorites" not in data: data["favorites"] = []
+                return data
+        except:
+            return {"global": {}, "scenarios": {}, "favorites": []}
+
+    def save_settings(self):
+        with open(self.config_path, 'w') as f:
+            json.dump(self.settings, f, indent=2)
+
+    def get(self, key, scenario=None, default=None):
+        if scenario and scenario in self.settings["scenarios"]:
+            if key in self.settings["scenarios"][scenario]:
+                return self.settings["scenarios"][scenario][key]
+        if key in self.settings["global"]:
+            return self.settings["global"][key]
+        return default
+
+    def set_global(self, key, value):
+        self.settings["global"][key] = value
+        self.save_settings()
+
+    def set_scenario(self, scenario, key, value):
+        if scenario not in self.settings["scenarios"]:
+            self.settings["scenarios"][scenario] = {}
+        self.settings["scenarios"][scenario][key] = value
+        self.save_settings()
+
+    # --- FAVORITES ---
+    def get_favorites(self):
+        return self.settings.get("favorites", [])
+
+    def add_favorite(self, scenario_name):
+        favs = self.get_favorites()
+        if scenario_name not in favs:
+            favs.append(scenario_name)
+            self.settings["favorites"] = favs
+            self.save_settings()
+
+    def remove_favorite(self, scenario_name):
+        favs = self.get_favorites()
+        if scenario_name in favs:
+            favs.remove(scenario_name)
+            self.settings["favorites"] = favs
+            self.save_settings()
+            
+    def is_favorite(self, scenario_name):
+        return scenario_name in self.get_favorites()
+--- END OF FILE: core\config_manager.py ---
+
+--- START OF FILE: core\engine.py ---
+import os
+import pandas as pd
+from pathlib import Path
+import re
+import json
+from datetime import datetime, timedelta
+from collections import defaultdict
+import bisect
+
+APP_DATA_DIR = Path.home() / '.kovaaks_stats_viewer'
+APP_DATA_DIR.mkdir(exist_ok=True) 
+
+CACHE_HISTORY_PATH = APP_DATA_DIR / 'kovaaks_history_cache.pkl'
+CACHE_INFO_PATH = APP_DATA_DIR / 'kovaaks_cache_info.json'
+
+# --- 1. CORE PARSING ---
+def parse_kovaaks_stats_file(file_path):
+    try:
+        filename = os.path.basename(file_path)
+        timestamp_match = re.search(r'(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2})', filename)
+        if timestamp_match:
+            timestamp_str = timestamp_match.group(1)
+            end_time = datetime.strptime(timestamp_str, '%Y.%m.%d-%H.%M.%S')
+        else:
+            end_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            
+        data = {'Duration': 60.0} 
+        start_time_str = None
+        
+        for line in lines:
+            if line.startswith('Scenario:'): data['Scenario'] = line.split(',', 1)[1].strip()
+            elif line.startswith('Score:'): data['Score'] = float(line.split(',')[1].strip())
+            elif line.startswith('Horiz Sens:'): data['Sens'] = float(line.split(',')[1].strip())
+            elif line.startswith('Challenge Start:'): start_time_str = line.split(',')[1].strip()
+        
+        if start_time_str:
+            try:
+                if '.' in start_time_str and len(start_time_str.split('.')[1]) > 6:
+                    start_time_str = start_time_str[:start_time_str.find('.')+7]
+                parsed_time = datetime.strptime(start_time_str, '%H:%M:%S.%f').time()
+                start_time = end_time.replace(hour=parsed_time.hour, minute=parsed_time.minute, 
+                                              second=parsed_time.second, microsecond=parsed_time.microsecond)
+                if start_time > end_time: start_time -= timedelta(days=1)
+                duration_seconds = (end_time - start_time).total_seconds()
+                if 0 < duration_seconds < 600: data['Duration'] = duration_seconds
+            except: pass
+
+        if 'Scenario' in data and 'Score' in data and 'Sens' in data:
+            data['Timestamp'] = end_time
+            return data
+        else: return None
+    except: return None
+
+def _detect_and_assign_sessions(history_df, session_gap_minutes=30):
+    if history_df.empty or 'Timestamp' not in history_df.columns: return history_df
+    df = history_df.copy()
+    df.sort_values('Timestamp', inplace=True)
+    time_diffs = df['Timestamp'].diff()
+    session_starts = time_diffs > pd.Timedelta(minutes=session_gap_minutes)
+    session_ids = session_starts.cumsum()
+    df['SessionID'] = session_ids
+    return df
+
+def find_and_process_stats(stats_folder_path, session_gap_minutes=30):
+    path_obj = Path(stats_folder_path)
+    if not path_obj.is_dir(): return None
+    
+    processed_files_info = {}
+    cached_history_df = pd.DataFrame()
+    
+    if os.path.exists(CACHE_HISTORY_PATH) and os.path.exists(CACHE_INFO_PATH):
+        try:
+            cached_history_df = pd.read_pickle(CACHE_HISTORY_PATH)
+            with open(CACHE_INFO_PATH, 'r') as f: processed_files_info = json.load(f)
+        except: pass
+            
+    all_challenge_files = list(path_obj.glob('*- Challenge -*.csv'))
+    new_files_to_process = []
+    current_files_info = {}
+    
+    for file_path in all_challenge_files:
+        try:
+            mtime = os.path.getmtime(file_path)
+            current_files_info[str(file_path)] = mtime
+            if str(file_path) not in processed_files_info or mtime > processed_files_info[str(file_path)]:
+                new_files_to_process.append(file_path)
+        except: continue
+
+    if new_files_to_process:
+        newly_parsed_data = [d for d in (parse_kovaaks_stats_file(fp) for fp in new_files_to_process) if d]
+        if newly_parsed_data:
+            new_df = pd.DataFrame(newly_parsed_data)
+            combined_history_df = pd.concat([cached_history_df, new_df], ignore_index=True)
+            combined_history_df.drop_duplicates(subset=['Scenario', 'Sens', 'Timestamp', 'Score'], inplace=True)
+        else: combined_history_df = cached_history_df
+    else: combined_history_df = cached_history_df
+        
+    if combined_history_df.empty: return pd.DataFrame()
+    combined_history_df = _detect_and_assign_sessions(combined_history_df, session_gap_minutes)
+
+    try:
+        combined_history_df.to_pickle(CACHE_HISTORY_PATH)
+        with open(CACHE_INFO_PATH, 'w') as f: json.dump(current_files_info, f, indent=2)
+    except: pass
+    return combined_history_df.reset_index(drop=True)
+
+def get_scenario_family_info(all_runs_df, base_scenario):
+    if all_runs_df is None or all_runs_df.empty: return None
+    family_df = all_runs_df[all_runs_df['Scenario'].str.startswith(base_scenario)].copy()
+    if family_df.empty: return None
+    
+    memo = {}
+
+    def parse_modifiers(scenario_name):
+        if scenario_name in memo:
+            return memo[scenario_name]
+
+        modifier_str = scenario_name.replace(base_scenario, '', 1).strip()
+        if not modifier_str: return {}
+        
+        UNIT_MAP = {'s': 'Duration', 'sec': 'Duration', 'm': 'Distance', 'hp': 'Health'}
+        token_pattern = re.compile(r'(\d[\d.]*%?[a-zA-Z]*|[A-Za-z]+)')
+        tokens = token_pattern.findall(modifier_str)
+        
+        def is_value(token):
+            if re.fullmatch(r'[\d.]+%?', token): return True
+            unit_match = re.fullmatch(r'([\d.]+%?)(\w+)', token)
+            if unit_match and unit_match.groups()[1] in UNIT_MAP: return True
+            return False
+            
+        modifiers = {}
+        consumed = [False] * len(tokens); i = 0
+        while i < len(tokens) - 1:
+            if not consumed[i] and not consumed[i+1]:
+                t1, t2 = tokens[i], tokens[i+1]
+                if not is_value(t1) and is_value(t2): 
+                    modifiers[t1] = (t2, 'word_value'); consumed[i] = consumed[i+1] = True; i += 2; continue
+                elif is_value(t1) and not is_value(t2): 
+                    modifiers[t2] = (t1, 'value_word'); consumed[i] = consumed[i+1] = True; i += 2; continue
+            i += 1
+        for i, token in enumerate(tokens):
+            if not consumed[i]:
+                unit_match = re.fullmatch(r'([\d.]+%?)(\w+)', token)
+                if unit_match:
+                    value, unit = unit_match.groups()
+                    if unit in UNIT_MAP: modifiers[UNIT_MAP[unit]] = (token, 'standalone'); consumed[i] = True
+                elif '%' in token and is_value(token):
+                    modifiers['Percent'] = (token, 'standalone'); consumed[i] = True
+        
+        # CRITICAL V1 LOGIC: Filter out "Dirty" matches
+        if not all(consumed):
+             memo[scenario_name] = {}
+             return {}
+             
+        memo[scenario_name] = modifiers
+        return modifiers
+        
+    family_df['Modifiers'] = family_df['Scenario'].apply(parse_modifiers)
+    return family_df
+
+# --- 2. ENRICHMENT (RANKS) ---
+
+def enrich_history_with_stats(df):
+    """Calculates PBs and Assigns Ranks"""
+    if df is None or df.empty: return df
+    df = df.sort_values('Timestamp').copy()
+    
+    # Rank Definitions
+    ranks = [("SINGULARITY", 100), ("ARCADIA", 95), ("UBER", 90), ("EXALTED", 82), ("BLESSED", 75), ("TRANSMUTE", 55)]
+    gated = {"SINGULARITY", "ARCADIA", "UBER"}
+    
+    # Initialize Rank Columns
+    for r, _ in ranks: df[f'Rank_{r}'] = 0
+    df['Is_PB'] = False
+
+    # Process by Combo
+    updates = []
+    
+    for (scen, sens), group in df.groupby(['Scenario', 'Sens']):
+        history = []
+        indices = group.index
+        scores = group['Score'].values
+        
+        for i, score in enumerate(scores):
+            idx = indices[i]
+            run_count = i + 1
+            
+            # PB Logic
+            is_pb = False
+            if not history: is_pb = False # First run isn't an "Improvement"
+            elif score > history[-1]: is_pb = True
+            
+            if is_pb: updates.append((idx, 'Is_PB', True))
+            
+            # Rank Logic
+            if not history: # First run is peak
+                percentile = 100
+            elif score >= history[-1]: 
+                percentile = 100
+            else:
+                pos = bisect.bisect_left(history, score)
+                percentile = (pos / len(history)) * 100
+            
+            bisect.insort(history, score)
+            
+            for r_name, r_val in ranks:
+                if r_name in gated and run_count < 10: continue
+                if percentile >= r_val:
+                    updates.append((idx, f'Rank_{r_name}', 1))
+
+    # Apply updates efficiently
+    # We reconstruct small DFs to update main DF
+    for col in ['Is_PB'] + [f'Rank_{r[0]}' for r in ranks]:
+        df[col] = df[col].astype(int) # Ensure int for ranks
+        
+    for idx, col, val in updates:
+        df.at[idx, col] = val
+        
+    return df
+
+# --- 3. ANALYSIS ---
+
+def format_timedelta(td):
+    if isinstance(td, (int, float)): td = timedelta(seconds=td)
+    total_seconds = int(td.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{hours:02}:{minutes:02}:{seconds:02}'
+
+def format_timedelta_hours(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h {minutes}m"
+
+def calculate_detailed_stats(runs_df):
+    if runs_df is None or runs_df.empty: return {}
+    df = runs_df.sort_values('Timestamp').copy()
+    scores = df['Score']
+    pb_idx = scores.idxmax()
+    
+    stats = {
+        'count': len(df), 'max': scores.max(), 'avg': scores.mean(),
+        'std': scores.std() if len(df) > 1 else 0.0,
+        'p50': scores.median(), 'p75': scores.quantile(0.75), 'min': scores.min(),
+        'pb_date': df.loc[pb_idx]['Timestamp'],
+        'pb_sens': df.loc[pb_idx]['Sens']
+    }
+    
+    recent = df.tail(min(len(df), 20))
+    if not recent.empty: stats['recent_avg'] = recent['Score'].mean()
+    
+    pre_pb = df.loc[:pb_idx].iloc[:-1].tail(20)
+    stats['launchpad_avg'] = pre_pb['Score'].mean() if not pre_pb.empty else 0.0
+    return stats
+
+def calculate_profile_stats(df):
+    """Aggregates stats for Career Profile"""
+    if df is None or df.empty: return {}
+    
+    stats = {
+        'total_runs': len(df),
+        'active_time': df['Duration'].sum(),
+        'unique_scens': df['Scenario'].nunique(),
+        'unique_combos': df.groupby(['Scenario', 'Sens']).ngroups,
+        'total_pbs': df['Is_PB'].sum()
+    }
+    
+    # Ranks
+    ranks = {}
+    for col in df.columns:
+        if col.startswith('Rank_'):
+            ranks[col.replace('Rank_', '')] = df[col].sum()
+    stats['ranks'] = ranks
+    
+    # Top Scenarios
+    stats['top_scens'] = df['Scenario'].value_counts().head(10).to_dict()
+    
+    return stats
+
+def analyze_session(session_df, history_df, flow_window=5):
+    if session_df.empty: return None
+    session_start = session_df['Timestamp'].min()
+    prior_history = history_df[history_df['Timestamp'] < session_start]
+
+    base_grid_avg = prior_history.groupby(['Scenario', 'Sens'])['Score'].mean().to_dict() if not prior_history.empty else {}
+    base_scen_avg = prior_history.groupby('Scenario')['Score'].mean().to_dict() if not prior_history.empty else {}
+    
+    base_grid_max = prior_history.groupby(['Scenario', 'Sens'])['Score'].max().to_dict() if not prior_history.empty else {}
+    base_scen_max = prior_history.groupby('Scenario')['Score'].max().to_dict() if not prior_history.empty else {}
+
+    def calc_graph(key_func, baselines):
+        data, hist = [], []
+        prev_pulse = 0.0
+        accs = defaultdict(lambda: {'sum':0.0, 'count':0})
+        
+        for i, row in enumerate(session_df.sort_values('Timestamp').itertuples()):
+            key = key_func(row)
+            base = baselines.get(key, 0)
+            acc = accs[key]
+            acc['sum']+=row.Score; acc['count']+=1
+            curr_avg = acc['sum']/acc['count']
+            eff_base = base if base > 0 else curr_avg
+            
+            score_pct = ((row.Score - eff_base)/eff_base)*100 if eff_base>0 else 0
+            trend_pct = ((curr_avg - eff_base)/eff_base)*100 if eff_base>0 else 0
+            hist.append(score_pct)
+            flow_pct = sum(hist[-flow_window:])/len(hist[-flow_window:])
+            pulse_pct = score_pct if i==0 else (score_pct*0.5)+(prev_pulse*0.5)
+            prev_pulse = pulse_pct
+            
+            data.append({
+                'time': int(row.Timestamp.timestamp()), 'pct': score_pct,
+                'trend_pct': trend_pct, 'flow_pct': flow_pct, 'pulse_pct': pulse_pct,
+                'scenario': row.Scenario, 'sens': row.Sens
+            })
+        return data
+
+    def calc_lists(grouper, base_max):
+        pbs, played = [], []
+        for key, g in session_df.groupby(grouper):
+            pb = g['Score'].max()
+            name = key[0] if isinstance(key, tuple) else key
+            sens = key[1] if isinstance(key, tuple) else None
+            
+            is_pb = False
+            prev = base_max.get(key)
+            if prev and pb > prev:
+                is_pb = True
+                pbs.append({'name': name, 'sens': sens, 'score': pb, 'prev': prev, 'imp': pb-prev, 'imp_pct': ((pb-prev)/prev)*100})
+            
+            played.append({'name': name, 'sens': sens, 'count': len(g), 'best': pb, 'avg': g['Score'].mean(), 'is_pb': is_pb})
+        return pbs, [], played # skipping avgs list for brevity as logic is similar
+
+    g_graph = calc_graph(lambda r: (r.Scenario, r.Sens), base_grid_avg)
+    s_graph = calc_graph(lambda r: r.Scenario, base_scen_avg)
+    
+    pbs_g, _, played_g = calc_lists(['Scenario', 'Sens'], base_grid_max)
+    pbs_s, _, played_s = calc_lists('Scenario', base_scen_max)
+
+    return {
+        "meta": {
+            "date_str": session_start.strftime('%B %d, %Y'),
+            "duration_str": format_timedelta(session_df['Timestamp'].max() - session_start),
+            "active_str": format_timedelta(session_df['Duration'].sum()),
+            "play_count": len(session_df)
+        },
+        "grid": {"graph_data": g_graph, "lists": {"pbs": pbs_g, "played": played_g, "avgs": []}, "pb_count": len(pbs_g)},
+        "scenario": {"graph_data": s_graph, "lists": {"pbs": pbs_s, "played": played_s, "avgs": []}, "pb_count": len(pbs_s)}
+    }
+--- END OF FILE: core\engine.py ---
+
+--- START OF FILE: core\locales.py ---
+# locales.py
+
+# --- CENTRAL VERSION CONTROL ---
+APP_VERSION = "v2.0"
+# -------------------------------
+
+# Dictionary of all text used in the app
+TRANSLATIONS = {
+    "en": {
+        # Main UI
+        "window_title": "Variant Stats Viewer by iyo & Gemini ({ver})", # Use {ver} placeholder
+        "search_label": "Search for Base Scenario:",
+        "ready_label": "Ready. Select stats folder and click 'Load Stats'.",
+        "loading_label": "Loading stats, please wait...",
+        "loaded_label": "Loaded {count} total runs. Ready to search.",
+        "load_err_label": "Load failed or no data found.",
+        "load_btn": "Load Stats",
+        "refresh_btn": "Refresh Stats (F5)",
+        "session_report_btn": "Last Session Report",
+        "session_hist_btn": "Session History",
+        "select_folder_btn": "Select Stats Folder",
+        "hint_hide": "(Right-click Scenario/CM to hide)",
+        
+        # Lists
+        "recently_played": "Recently Played",
+        "favorites": "Favorites",
+        "recents": "Recents",
+        "compare_by": "Compare by:",
+        "filter_format": "Filter Format:",
+        
+        # Settings Row
+        "session_gap": "Session Gap (min):",
+        "req_refresh": "(Requires Refresh)",
+        "theme": "Theme:",
+        "show_decimals": "Show Decimals",
+        "manage_hidden": "Manage Hidden",
+        "font_size": "Font Size:",
+        "cell_h": "Cell H:",
+        
+        # Analysis Modes
+        "sens_filter": "Sens Filter:",
+        "grid_mode": "Grid Mode:",
+        "highlight": "Highlight:",
+        "pb_num": "PB #:",
+        "target": "Target:",
+        
+        # Dropdown Options & Radio Buttons
+        "opt_all": "All",
+        "opt_5cm": "5cm Inc.",
+        "opt_10cm": "10cm Inc.",
+        "opt_custom_step": "Custom Step",
+        "opt_specific": "Specific List",
+        
+        "mode_pb": "Personal Best",
+        "mode_avg": "Average Score",
+        "mode_count": "Play Count",
+        "mode_percentile": "Nth Percentile",
+        
+        "hl_none": "None",
+        "hl_drop": "Performance Drop",
+        "hl_row_heat": "Row Heatmap",
+        "hl_global_heat": "Global Heatmap",
+        "hl_target": "Target Score",
+        "hl_recent_success": "Recent Success (Days)",
+        
+        # Grid Headers / Tooltips
+        "rating": "Global Average: {val}",
+        "avg_row": "-- Averages --",
+        "col_avg": "AVG",
+        "col_best": "Best",
+        "col_cm": "cm",
+        "tooltip_sens": "Sensitivity: {val}",
+        "tooltip_pb": "PB: {val} (on {date})",
+        "tooltip_runs": "Runs: {val}",
+        "tooltip_avg": "Avg: {val}",
+        "tooltip_med": "Median: {val} | 75th: {val2}",
+        "tooltip_launchpad": "Avg before prev PB: {val}",
+        "tooltip_recent": "Recent Avg:    {val}",
+        
+        # Session Report
+        "rep_title": "Session Report - {date}",
+        "rep_duration": "Total Duration",
+        "rep_active": "Active Playtime",
+        "rep_density": "Play Density",
+        "rep_plays": "Total Plays",
+        "rep_pbs": "Total PBs",
+        "rep_browse": "Browse History...",
+        "rep_refresh": "Refresh (F5)",
+        "rep_summarize": "Summarize by Scenario",
+        "rep_sort": "Sort by:",
+        "rep_graph_title": "Session Performance Flow",
+        
+        "sec_played": "Scenarios Played ({count})",
+        "sec_pbs": "Personal Bests ({count})",
+        "sec_avgs": "Average Score Comparison ({count})",
+        "sec_ranks": "Rank Achieved",
+        
+        "sort_perf": "Performance",
+        "sort_count": "Play Count",
+        "sort_order": "Order Played",
+        "sort_alpha": "Alphabetical",
+        
+        "lbl_session": "Session: {val} ({count} runs)",
+        "lbl_alltime": "All-Time: {val} ({count} runs)",
+        "lbl_new_pb": "New PB: {new} (vs. {old})",
+        
+        # Graph Window
+        "graph_view_mode": "View Mode:",
+        "graph_raw": "Raw Data",
+        "graph_daily": "Daily Avg",
+        "graph_weekly": "Weekly Avg",
+        "graph_monthly": "Monthly Avg",
+        "graph_session": "Session Avg",
+        "graph_grouped": "Grouped Avg", # NEW
+        "graph_hide_count": "Hide Count <=",
+        
+        "graph_hide_low": "Hide scores below:",
+        "graph_connect": "Connect Sessions",
+        "graph_4color": "4-Color Cycle",
+        "graph_color_sens": "Color by Sens", # NEW
+        "graph_group_size": "Group Size (N=)", # NEW
+        
+        # Misc
+        "restart_msg": "Please restart the application to apply language changes.",
+        "restart_title": "Restart Required",
+        "lang_label": "Language:",
+    },
+    
+    "jp": {
+        "window_title": "Variant Stats Viewer by iyo & Gemini ({ver})",
+        "search_label": "シナリオ検索:",
+        "ready_label": "準備完了。フォルダを選択して読み込んでください。",
+        "loading_label": "読み込み中...",
+        "loaded_label": "計{count}件のスコアを読み込みました。",
+        "load_err_label": "読み込み失敗、またはデータがありません。",
+        "load_btn": "スコア読み込み",
+        "refresh_btn": "更新 (F5)",
+        "session_report_btn": "前回のセッションレポート",
+        "session_hist_btn": "セッション履歴",
+        "select_folder_btn": "フォルダ選択",
+        "hint_hide": "(シナリオ/cmを右クリックで非表示)",
+        
+        "recently_played": "最近プレイしたシナリオ",
+        "favorites": "お気に入り",
+        "recents": "履歴",
+        "compare_by": "比較軸:",
+        "filter_format": "フィルタ形式:",
+        
+        "session_gap": "セッション間隔(分):",
+        "req_refresh": "(要再読込)",
+        "theme": "テーマ:",
+        "show_decimals": "小数表示",
+        "manage_hidden": "非表示管理",
+        "font_size": "文字サイズ:",
+        "cell_h": "セル高さ:",
+        
+        "sens_filter": "感度フィルタ:",
+        "grid_mode": "表示モード:",
+        "highlight": "ハイライト:",
+        "pb_num": "順位:",
+        "target": "目標:",
+        
+        "opt_all": "全て",
+        "opt_5cm": "5cm刻み",
+        "opt_10cm": "10cm刻み",
+        "opt_custom_step": "カスタム刻み",
+        "opt_specific": "指定リスト",
+        
+        "mode_pb": "自己ベスト",
+        "mode_avg": "平均スコア",
+        "mode_count": "プレイ回数",
+        "mode_percentile": "上位 N%",
+        
+        "hl_none": "なし",
+        "hl_drop": "スコア低下",
+        "hl_row_heat": "行ヒートマップ",
+        "hl_global_heat": "全体ヒートマップ",
+        "hl_target": "目標スコア",
+        "hl_recent_success": "最近の達成 (日数)",
+        
+        "rating": "全体平均: {val}",
+        "avg_row": "-- 平均 --",
+        "col_avg": "平均",
+        "col_best": "ベスト",
+        "col_cm": "cm",
+        "tooltip_sens": "感度: {val}",
+        "tooltip_pb": "PB: {val} ({date})",
+        "tooltip_runs": "回数: {val}",
+        "tooltip_avg": "平均: {val}",
+        "tooltip_med": "中央値: {val} | 75%: {val2}",
+        "tooltip_launchpad": "PB更新直前の平均: {val}",
+        "tooltip_recent": "直近平均:    {val}",
+        
+        "rep_title": "セッションレポート - {date}",
+        "rep_duration": "総時間",
+        "rep_active": "プレイ時間",
+        "rep_density": "プレイ密度",
+        "rep_plays": "プレイ回数",
+        "rep_pbs": "更新数",
+        "rep_browse": "履歴を見る...",
+        "rep_refresh": "更新 (F5)",
+        "rep_summarize": "シナリオ別に集計",
+        "rep_sort": "並び替え:",
+        "rep_graph_title": "セッションパフォーマンス推移",
+        
+        "sec_played": "プレイしたシナリオ ({count})",
+        "sec_pbs": "自己ベスト更新 ({count})",
+        "sec_avgs": "平均スコア比較 ({count})",
+        "sec_ranks": "ランク獲得数",
+        
+        "sort_perf": "パフォーマンス",
+        "sort_count": "回数",
+        "sort_order": "プレイ順",
+        "sort_alpha": "名前順",
+        
+        "lbl_session": "今回: {val} ({count}回)",
+        "lbl_alltime": "通算: {val} ({count}回)",
+        "lbl_new_pb": "新記録: {new} (旧: {old})",
+        
+        "graph_view_mode": "表示モード:",
+        "graph_raw": "生データ",
+        "graph_daily": "日別平均",
+        "graph_weekly": "週別平均",
+        "graph_monthly": "月別平均",
+        "graph_session": "セッション平均",
+        "graph_grouped": "グループ平均", # NEW
+        
+        "graph_hide_low": "以下のスコアを非表示:",
+        "graph_connect": "セッションを繋ぐ",
+        "graph_4color": "4色サイクル",
+        "graph_color_sens": "感度別カラー", # NEW
+        "graph_group_size": "グループサイズ (N=)", # NEW
+        
+        "restart_msg": "言語変更を適用するには再起動してください。",
+        "restart_title": "再起動が必要です",
+        "lang_label": "言語:",
+    },
+    #just these two languages for now
+}
+
+def get_text(lang_code, key, **kwargs):
+    """
+    Retrieves text for the given language code and key.
+    Falls back to 'en' if language or key is missing.
+    Accepts kwargs for string formatting (e.g., {val}).
+    Injects {ver} automatically if not provided.
+    """
+    # Auto-inject version if not provided
+    kwargs.setdefault('ver', APP_VERSION)
+
+    lang_dict = TRANSLATIONS.get(lang_code, TRANSLATIONS["en"])
+    text = lang_dict.get(key, TRANSLATIONS["en"].get(key, f"MISSING: {key}"))
+    
+    if kwargs:
+        try:
+            return text.format(**kwargs)
+        except KeyError:
+            return text
+    return text
+--- END OF FILE: core\locales.py ---
+
+--- START OF FILE: core\state_manager.py ---
+from PyQt6.QtCore import QObject, pyqtSignal
+
+class StateManager(QObject):
+    """
+    Central Hub for application state.
+    """
+    # Emitted when engine loads new data
+    data_updated = pyqtSignal(object) 
+    
+    # Emitted when user changes the MAIN PAGE (Sidebar/Search)
+    scenario_selected = pyqtSignal(str) 
+
+    # NEW: Emitted when user clicks a specific row/variant (Updates Graph only)
+    variant_selected = pyqtSignal(str)
+
+    # Emitted when settings change
+    settings_changed = pyqtSignal() 
+
+    session_selected = pyqtSignal(int) # Payload: Session ID
+
+    def __init__(self):
+        super().__init__()
+--- END OF FILE: core\state_manager.py ---
+
+--- START OF FILE: download_lib.py ---
+import urllib.request
+from pathlib import Path
+
+# The official TradingView Lightweight Charts library
+URL = "https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"
+
+# Path: Kovaaks_V2/modules/charts/lightweight-charts.js
+DEST = Path(__file__).parent / "modules" / "charts" / "lightweight-charts.js"
+
+print(f"Downloading library to: {DEST}...")
+
+try:
+    with urllib.request.urlopen(URL) as response:
+        data = response.read()
+        with open(DEST, 'wb') as f:
+            f.write(data)
+    print("Success! File saved.")
+except Exception as e:
+    print(f"Error: {e}")
+--- END OF FILE: download_lib.py ---
+
+--- START OF FILE: main.py ---
+import sys
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QDockWidget, QLabel, QSplitter, 
+                             QMenu, QPushButton, QHBoxLayout, QVBoxLayout, QWidget, QFileDialog)
+from PyQt6.QtGui import QAction, QKeySequence, QShortcut
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QByteArray
+from pathlib import Path
+
+import styles
+from core.state_manager import StateManager
+from core.config_manager import ConfigManager
+from core import engine
+
+# Modules
+from modules.navigation.browser_tabs import BrowserTabs
+from modules.dashboard.grid_container import GridContainer
+from modules.charts.chart_widget import ChartWidget
+from modules.right_panel.analyst_tabs import AnalystTabs
+
+class DataLoader(QThread):
+    finished = pyqtSignal(object)
+    def __init__(self, path): super().__init__(); self.path = path
+    def run(self):
+        df = engine.find_and_process_stats(self.path)
+        if df is not None and not df.empty: df = engine.enrich_history_with_stats(df)
+        self.finished.emit(df)
+
+class KovaaksV2App(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("VSV 2.0")
+        self.resize(1800, 1000)
+        self.setStyleSheet(styles.QSS)
+        
+        self.state_manager = StateManager()
+        self.config_manager = ConfigManager()
+        self.current_stats_path = None
+
+        self.setDockOptions(QMainWindow.DockOption.AllowNestedDocks | 
+                            QMainWindow.DockOption.AnimatedDocks | 
+                            QMainWindow.DockOption.AllowTabbedDocks)
+
+        self.setup_layout() # Builds the whole UI structure
+        self.setup_menu()   # Adds the top 'View' menu
+        self.load_app_state() 
+        
+        self.shortcut_refresh = QShortcut(QKeySequence("F5"), self)
+        self.shortcut_refresh.activated.connect(self.refresh_stats)
+        
+        self.auto_load()
+
+    def setup_layout(self):
+        # --- CENTRAL WIDGET CONTAINER ---
+        # We create a container to hold the Custom Toolbar + The Splitter
+        self.central_container = QWidget()
+        self.central_layout = QVBoxLayout(self.central_container)
+        self.central_layout.setContentsMargins(0, 0, 0, 0)
+        self.central_layout.setSpacing(0)
+        self.setCentralWidget(self.central_container)
+
+        # 1. CUSTOM HEADER (The Toolbar)
+        self.header_widget = QWidget()
+        self.header_widget.setFixedHeight(50)
+        self.header_widget.setStyleSheet("background-color: #131722; border-bottom: 1px solid #363a45;")
+        header_layout = QHBoxLayout(self.header_widget)
+        header_layout.setContentsMargins(20, 0, 20, 0)
+        
+        # Logo
+        lbl = QLabel("ANALYTICS")
+        lbl.setStyleSheet("font-weight: bold; font-size: 16px; color: #d1d4dc; margin-right: 20px;")
+        header_layout.addWidget(lbl)
+        
+        header_layout.addStretch()
+        
+        # Load Button
+        btn_load = QPushButton("Load Folder")
+        btn_load.clicked.connect(self.select_folder)
+        btn_load.setStyleSheet("""
+            QPushButton { background-color: #2a2e39; border: 1px solid #363a45; color: #d1d4dc; padding: 6px 12px; }
+            QPushButton:hover { background-color: #363a45; }
+        """)
+        header_layout.addWidget(btn_load)
+        
+        # Refresh Button
+        self.btn_refresh = QPushButton("Refresh (F5)")
+        self.btn_refresh.clicked.connect(self.refresh_stats)
+        self.btn_refresh.setStyleSheet("""
+            QPushButton { background-color: #2962FF; border: none; color: white; padding: 6px 12px; font-weight: bold;}
+            QPushButton:hover { background-color: #1e53e5; }
+            QPushButton:disabled { background-color: #363a45; color: #787b86; }
+        """)
+        header_layout.addWidget(self.btn_refresh)
+        
+        # Add Header to Central Layout
+        self.central_layout.addWidget(self.header_widget)
+
+        # 2. SPLITTER (Chart + Grid)
+        self.center_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.center_splitter.setObjectName("CenterSplitter")
+        
+        self.chart_widget = ChartWidget(self.state_manager)
+        self.chart_widget.setMinimumHeight(200)
+        
+        self.grid_container = GridContainer(self.state_manager, self.config_manager)
+        self.grid_container.setMinimumHeight(200)
+        
+        self.center_splitter.addWidget(self.chart_widget)
+        self.center_splitter.addWidget(self.grid_container)
+        
+        # Add Splitter to Central Layout (Below Header)
+        self.central_layout.addWidget(self.center_splitter)
+
+        # 3. DOCKS (Sidebars)
+        self.dock_nav = QDockWidget("Browser", self)
+        self.dock_nav.setObjectName("DockNav")
+        self.dock_nav.setMinimumWidth(50) 
+        self.dock_nav.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea)
+        self.dock_nav.setWidget(BrowserTabs(self.state_manager, self.config_manager))
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.dock_nav)
+
+        self.dock_analyst = QDockWidget("Analyst", self)
+        self.dock_analyst.setObjectName("DockAnalyst")
+        self.dock_analyst.setMinimumWidth(50)
+        self.dock_analyst.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea)
+        self.dock_analyst.setWidget(AnalystTabs(self.state_manager))
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock_analyst)
+
+    def setup_menu(self):
+        # Standard Menu Bar
+        menu_bar = self.menuBar()
+        view_menu = menu_bar.addMenu("View")
+        
+        def add_dock_toggle(dock):
+            action = dock.toggleViewAction()
+            view_menu.addAction(action)
+        
+        add_dock_toggle(self.dock_nav)
+        add_dock_toggle(self.dock_analyst)
+
+    # --- LOGIC ---
+
+    def auto_load(self):
+        saved_path = self.config_manager.get("stats_path")
+        if saved_path and Path(saved_path).exists():
+            self.start_loading(saved_path)
+            return
+
+        paths = [
+            Path("C:/Program Files (x86)/Steam/steamapps/common/FPSAimTrainer/FPSAimTrainer/stats"),
+            Path("D:/SteamLibrary/steamapps/common/FPSAimTrainer/FPSAimTrainer/stats")
+        ]
+        for p in paths:
+            if p.exists():
+                self.start_loading(str(p))
+                break
+
+    def select_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Stats Folder")
+        if folder:
+            self.config_manager.set_global("stats_path", folder)
+            self.start_loading(folder)
+
+    def refresh_stats(self):
+        if self.current_stats_path:
+            self.start_loading(self.current_stats_path)
+
+    def start_loading(self, path):
+        self.current_stats_path = path
+        self.btn_refresh.setEnabled(False)
+        self.btn_refresh.setText("Loading...")
+        
+        self.worker = DataLoader(path)
+        self.worker.finished.connect(self.on_data_loaded)
+        self.worker.start()
+
+    def on_data_loaded(self, df):
+        self.btn_refresh.setEnabled(True)
+        self.btn_refresh.setText("Refresh (F5)")
+        self.state_manager.data_updated.emit(df)
+        self.grid_container.restore_state()
+
+    # --- PERSISTENCE ---
+    def closeEvent(self, event):
+        settings = {
+            "geometry": self.saveGeometry().toHex().data().decode(),
+            "windowState": self.saveState().toHex().data().decode(),
+            "splitterState": self.center_splitter.saveState().toHex().data().decode()
+        }
+        self.config_manager.set_global("app_layout", settings)
+        self.grid_container.save_state()
+        super().closeEvent(event)
+
+    def load_app_state(self):
+        settings = self.config_manager.get("app_layout", default={})
+        if "geometry" in settings:
+            self.restoreGeometry(QByteArray.fromHex(settings["geometry"].encode()))
+        if "windowState" in settings:
+            self.restoreState(QByteArray.fromHex(settings["windowState"].encode()))
+        if "splitterState" in settings:
+            self.center_splitter.restoreState(QByteArray.fromHex(settings["splitterState"].encode()))
+        else:
+            self.resizeDocks([self.dock_nav], [250], Qt.Orientation.Horizontal)
+            self.resizeDocks([self.dock_analyst], [400], Qt.Orientation.Horizontal)
+            self.center_splitter.setStretchFactor(0, 4)
+            self.center_splitter.setStretchFactor(1, 6)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = KovaaksV2App()
+    window.show()
+    sys.exit(app.exec())
+--- END OF FILE: main.py ---
+
+--- START OF FILE: modules\career\career_widget.py ---
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, 
+                             QScrollArea, QGridLayout, QToolButton)
+from PyQt6.QtCore import Qt
+import pandas as pd
+from core import engine, locales
+
+class CareerWidget(QWidget):
+    def __init__(self, state_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        self.full_df = None
+        self.setup_ui()
+        self.state_manager.data_updated.connect(self.on_data_updated)
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("background: #131722; border: none;")
+        layout.addWidget(self.scroll)
+        
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(20, 20, 20, 20)
+        self.content_layout.setSpacing(20)
+        self.scroll.setWidget(self.content)
+
+    def on_data_updated(self, df):
+        if df is None: return
+        self.full_df = df
+        
+        # Calculate Stats
+        stats = engine.calculate_profile_stats(df)
+        self.render_view(stats)
+
+    def render_view(self, stats):
+        # Clear
+        while self.content_layout.count():
+            item = self.content_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        # 1. TOP STATS GRID
+        grid_frame = QFrame()
+        grid = QGridLayout(grid_frame)
+        grid.setSpacing(15)
+        
+        # Using keys for future localization
+        self.add_stat_card(grid, 0, 0, locales.get_text("cp_total_runs", "Total Runs"), f"{stats['total_runs']:,}")
+        self.add_stat_card(grid, 0, 1, locales.get_text("cp_active_time", "Active Playtime"), engine.format_timedelta_hours(stats['active_time']))
+        self.add_stat_card(grid, 0, 2, locales.get_text("cp_total_pbs", "Total PBs"), f"{stats['total_pbs']:,}")
+        self.add_stat_card(grid, 1, 0, locales.get_text("cp_scenarios", "Unique Scenarios"), f"{stats['unique_scens']:,}")
+        self.add_stat_card(grid, 1, 1, locales.get_text("cp_combos", "Unique Combos"), f"{stats['unique_combos']:,}")
+        
+        self.content_layout.addWidget(grid_frame)
+
+        # 2. RANKS
+        lbl_rank = QLabel(locales.get_text("cp_ranks", "Rank Distribution"))
+        lbl_rank.setStyleSheet("font-weight: bold; font-size: 16px; margin-top: 10px;")
+        self.content_layout.addWidget(lbl_rank)
+        
+        rank_frame = QFrame()
+        r_layout = QHBoxLayout(rank_frame)
+        r_layout.setSpacing(10)
+        
+        # Order: Transmute -> Singularity
+        rank_order = ["TRANSMUTE", "BLESSED", "EXALTED", "UBER", "ARCADIA", "SINGULARITY"]
+        colors = ["#448AFF", "#FF5252", "#FDD835", "#673AB7", "#2E7D32", "#000000"]
+        
+        for i, name in enumerate(rank_order):
+            count = stats['ranks'].get(name, 0)
+            self.add_rank_card(r_layout, name, count, colors[i])
+            
+        self.content_layout.addWidget(rank_frame)
+
+        # 3. MONTHLY ARCHIVES
+        lbl_hist = QLabel(locales.get_text("cp_history", "Monthly History"))
+        lbl_hist.setStyleSheet("font-weight: bold; font-size: 16px; margin-top: 10px;")
+        self.content_layout.addWidget(lbl_hist)
+        
+        # Group by Month
+        df = self.full_df.copy()
+        df['Month'] = df['Timestamp'].dt.to_period('M')
+        
+        for period in sorted(df['Month'].unique(), reverse=True):
+            m_df = df[df['Month'] == period]
+            self.add_month_row(period.strftime("%B %Y"), len(m_df), m_df['Duration'].sum())
+
+        self.content_layout.addStretch()
+
+    def add_stat_card(self, grid, r, c, label, value):
+        frame = QFrame()
+        frame.setStyleSheet("background: #1e222d; border-radius: 6px; border: 1px solid #363a45;")
+        lay = QVBoxLayout(frame)
+        
+        l1 = QLabel(label.upper())
+        l1.setStyleSheet("color: #787b86; font-size: 10px; font-weight: bold;")
+        l2 = QLabel(str(value))
+        l2.setStyleSheet("color: #d1d4dc; font-size: 20px; font-weight: bold;")
+        
+        lay.addWidget(l1)
+        lay.addWidget(l2)
+        grid.addWidget(frame, r, c)
+
+    def add_rank_card(self, layout, name, count, color):
+        frame = QFrame()
+        frame.setStyleSheet(f"background: {color}; border-radius: 4px;")
+        frame.setMinimumWidth(80)
+        lay = QVBoxLayout(frame)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        txt_col = "white" if name in ["SINGULARITY", "UBER", "ARCADIA"] else "black"
+        
+        l1 = QLabel(name[:3]) # Short name
+        l1.setStyleSheet(f"color: {txt_col}; font-size: 10px; font-weight: bold;")
+        l2 = QLabel(str(count))
+        l2.setStyleSheet(f"color: {txt_col}; font-size: 16px; font-weight: bold;")
+        
+        lay.addWidget(l1)
+        lay.addWidget(l2)
+        layout.addWidget(frame)
+
+    def add_month_row(self, title, runs, duration):
+        frame = QFrame()
+        frame.setStyleSheet("background: #1e222d; border-radius: 4px; border-left: 3px solid #2962FF;")
+        lay = QHBoxLayout(frame)
+        
+        lay.addWidget(QLabel(title))
+        lay.addStretch()
+        
+        dur_str = engine.format_timedelta_hours(duration)
+        info = f"{runs} Runs | {dur_str}"
+        lay.addWidget(QLabel(info))
+        
+        self.content_layout.addWidget(frame)
+--- END OF FILE: modules\career\career_widget.py ---
+
+--- START OF FILE: modules\charts\chart_widget.py ---
+import json
+import pandas as pd
+from pathlib import Path
+from PyQt6.QtWidgets import QWidget, QVBoxLayout
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+class ChartWidget(QWidget):
+    def __init__(self, state_manager, listen_to_global_signals=True):
+        """
+        TradingView Lightweight Charts Version: v5.0.9
+        
+        NOTE ON V5 API CHANGES:
+        - 'chart.addLineSeries()' is DEPRECATED/REMOVED.
+        - Use 'chart.addSeries(LightweightCharts.LineSeries, options)' instead.
+        - Ensure data is sorted by time (ascending) before passing to setData.
+        """
+        super().__init__()
+        self.state_manager = state_manager
+        self.all_runs_df = None 
+        self.is_loaded = False
+        self.pending_payload = None
+        self.listen_to_global = listen_to_global_signals # NEW FLAG
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.web = QWebEngineView()
+        self.web.setStyleSheet("background-color: #131722;")
+        
+        js_path = Path(__file__).parent / "lightweight-charts.js"
+        try:
+            with open(js_path, "r", encoding="utf-8") as f: js_lib = f.read()
+        except: js_lib = "console.error('JS Library not found on disk');"
+
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>body { background-color: #131722; margin: 0; overflow: hidden; }</style>
+            <script>
+            // INJECT_LIB_HERE
+            </script>
+        </head>
+        <body>
+            <div id="chart" style="width: 100%; height: 100vh;"></div>
+            <script>
+                var chart;
+                var seriesMap = {}; 
+                var pendingPayload = null;
+
+                window.onload = function() {
+                    if (typeof LightweightCharts === 'undefined') {
+                        document.body.innerHTML = '<h3 style="color:red">JS Error: Lib not loaded</h3>';
+                        return;
+                    }
+
+                    chart = LightweightCharts.createChart(document.getElementById('chart'), {
+                        layout: { background: { type: 'solid', color: '#131722' }, textColor: '#d1d4dc' },
+                        grid: { vertLines: { color: '#2B2B43' }, horzLines: { color: '#2B2B43' } },
+                        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                        timeScale: { borderColor: '#485c7b', timeVisible: true, secondsVisible: false },
+                    });
+
+                    if (pendingPayload) {
+                        renderChart(pendingPayload);
+                        pendingPayload = null;
+                    }
+                };
+
+                window.renderChart = function(payload) {
+                    if (!chart) {
+                        pendingPayload = payload;
+                        return;
+                    }
+                    
+                    const newIds = new Set(payload.map(p => p.id));
+                    for (let id in seriesMap) {
+                        if (!newIds.has(id)) {
+                            chart.removeSeries(seriesMap[id]);
+                            delete seriesMap[id];
+                        }
+                    }
+
+                    payload.forEach(item => {
+                        let series;
+                        if (seriesMap[item.id]) {
+                            series = seriesMap[item.id];
+                            series.applyOptions({ color: item.color, lineWidth: item.width });
+                        } else {
+                            series = chart.addSeries(LightweightCharts.LineSeries, {
+                                color: item.color,
+                                lineWidth: item.width,
+                                crosshairMarkerVisible: true
+                            });
+                            seriesMap[item.id] = series;
+                        }
+                        
+                        // Sort Data
+                        if (item.data) {
+                            item.data.sort((a, b) => a.time - b.time);
+                            series.setData(item.data);
+                        }
+
+                        // --- FIX: APPLY MARKERS ---
+                        if (item.markers) {
+                            item.markers.sort((a, b) => a.time - b.time);
+                            series.setMarkers(item.markers);
+                        } else {
+                            series.setMarkers([]); // Clear if none
+                        }
+                        // --------------------------
+                    });
+
+                    chart.timeScale().fitContent();
+                }
+            </script>
+        </body>
+        </html>
+        """
+        
+        final_html = html_template.replace("// INJECT_LIB_HERE", js_lib)
+        self.web.setHtml(final_html)
+        self.web.loadFinished.connect(self.on_load_finished)
+        layout.addWidget(self.web)
+
+        # CONNECT SIGNALS CONDITIONALLY
+        self.state_manager.data_updated.connect(self.on_data_updated)
+        
+        if self.listen_to_global:
+            self.state_manager.scenario_selected.connect(self.on_scenario_selected)
+            self.state_manager.variant_selected.connect(self.on_scenario_selected)
+
+    def on_load_finished(self, success):
+        self.is_loaded = True
+        if self.pending_payload:
+            self.plot_payload(self.pending_payload)
+
+    def plot_payload(self, payload_list):
+        if not self.is_loaded:
+            self.pending_payload = payload_list
+            return
+        json_str = json.dumps(payload_list)
+        self.web.page().runJavaScript(f"window.renderChart({json_str});")
+
+    def on_data_updated(self, df): self.all_runs_df = df
+
+    # DEFAULT BEHAVIOR (Main Tab Only)
+    def on_scenario_selected(self, scenario_name):
+        if not self.listen_to_global: return
+        if self.all_runs_df is None: return
+        
+        mask = self.all_runs_df['Scenario'].str.startswith(scenario_name)
+        df = self.all_runs_df[mask].copy()
+        if df.empty: return
+
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        df.sort_values('Timestamp', inplace=True)
+
+        data_points = []
+        for _, row in df.iterrows():
+            data_points.append({
+                'time': int(row['Timestamp'].timestamp()),
+                'value': float(row['Score'])
+            })
+
+        payload = [{
+            'id': 'main_score',
+            'color': '#2962FF',
+            'width': 2,
+            'data': data_points
+        }]
+        self.plot_payload(payload)
+--- END OF FILE: modules\charts\chart_widget.py ---
+
+--- START OF FILE: modules\charts\indicators.py ---
+# Plugins for Graph Lines
+
+class IndicatorBase:
+    name = "Base"
+    color = "#FFFFFF"
+    width = 2
+    style = "Solid" # Solid, Dotted, Dashed
+
+    def extract_data(self, processed_session_data):
+        """
+        Takes the list of dicts output by engine.analyze_session
+        Returns a list of {time, value} for TradingView
+        """
+        return []
+
+# --- IMPLEMENTATIONS ---
+
+class IndScore(IndicatorBase):
+    name = "Score"
+    color = "#4aa3df" # Light Blue
+    width = 2
+    def extract_data(self, data):
+        return [{'time': d['time'], 'value': d['pct']} for d in data]
+
+class IndTrend(IndicatorBase):
+    name = "Session Trend"
+    color = "#FF9800" # Orange
+    width = 2
+    def extract_data(self, data):
+        return [{'time': d['time'], 'value': d['trend_pct']} for d in data]
+
+class IndFlow(IndicatorBase):
+    name = "Global Flow"
+    color = "#9C27B0" # Purple
+    width = 2
+    def extract_data(self, data):
+        return [{'time': d['time'], 'value': d['flow_pct']} for d in data]
+
+class IndPulse(IndicatorBase):
+    name = "The Pulse"
+    color = "#00E5FF" # Cyan
+    width = 1
+    def extract_data(self, data):
+        return [{'time': d['time'], 'value': d['pulse_pct']} for d in data]
+
+# Registry
+AVAILABLE_INDICATORS = [IndTrend, IndFlow, IndPulse]
+--- END OF FILE: modules\charts\indicators.py ---
+
+--- START OF FILE: modules\dashboard\grid_container.py ---
+from PyQt6.QtWidgets import (QTabWidget, QTabBar, QMenu, QWidget, QVBoxLayout, 
+                             QPushButton, QToolButton)
+from PyQt6.QtCore import Qt, QPoint
+from PyQt6.QtGui import QAction, QCursor
+from modules.dashboard.grid_widget import GridWidget
+
+class GridContainer(QTabWidget):
+    def __init__(self, state_manager, config_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        self.config_manager = config_manager
+        self.all_runs_df = None 
+
+        self.setTabsClosable(True)
+        self.setMovable(True)
+        self.setDocumentMode(True)
+        
+        # Events
+        self.tabCloseRequested.connect(self.close_tab_request)
+        
+        # Context Menu
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+        
+        # CORNER WIDGET
+        self.btn_clear = QToolButton()
+        self.btn_clear.setText("Clear Unpinned")
+        self.btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear.clicked.connect(self.close_all_unpinned)
+        self.btn_clear.setStyleSheet("border: none; color: #787b86; font-weight: bold; padding: 2px 8px;")
+        self.setCornerWidget(self.btn_clear, Qt.Corner.TopRightCorner)
+
+        # Connect
+        self.state_manager.data_updated.connect(self.on_data_updated)
+        self.state_manager.scenario_selected.connect(self.open_scenario_tab)
+
+        # Style
+        self.setStyleSheet("""
+            QTabBar::tab {
+                background: #1e222d;
+                color: #787b86;
+                padding: 8px 15px;
+                border-right: 1px solid #363a45;
+                border-top: 2px solid transparent;
+                min-width: 120px;
+            }
+            QTabBar::tab:selected {
+                background: #131722;
+                color: #d1d4dc;
+                border-top: 2px solid #2962FF;
+            }
+            QTabBar::tab:hover {
+                background: #2a2e39;
+            }
+            QTabWidget::pane { 
+                border: none; 
+                background: #131722;
+            }
+        """)
+
+    def on_data_updated(self, df):
+        self.all_runs_df = df
+        for i in range(self.count()):
+            widget = self.widget(i)
+            if isinstance(widget, GridWidget): widget.on_data_updated(df)
+
+    def open_scenario_tab(self, scenario_name):
+        # Check existing
+        for i in range(self.count()):
+            clean_name = self.tabText(i).replace("★ ", "")
+            if clean_name == scenario_name:
+                self.setCurrentIndex(i)
+                return
+
+        new_grid = GridWidget(self.state_manager, self.config_manager)
+        if self.all_runs_df is not None:
+            new_grid.on_data_updated(self.all_runs_df)
+        
+        # Initialize
+        new_grid.on_scenario_selected(scenario_name)
+        
+        index = self.addTab(new_grid, scenario_name)
+        self.setCurrentIndex(index)
+        self.tabBar().setTabData(index, False) # Not pinned
+
+    # --- CLOSING LOGIC ---
+
+    def close_tab_request(self, index):
+        if self.is_pinned(index): return 
+        widget = self.widget(index)
+        self.removeTab(index)
+        widget.deleteLater()
+
+    def close_all_unpinned(self):
+        for i in range(self.count() - 1, -1, -1):
+            if not self.is_pinned(i):
+                self.close_tab_request(i)
+
+    # --- PINNING LOGIC ---
+
+    def is_pinned(self, index):
+        data = self.tabBar().tabData(index)
+        return data is True
+
+    def toggle_pin(self, index):
+        current_state = self.is_pinned(index)
+        new_state = not current_state
+        self.tabBar().setTabData(index, new_state)
+        
+        text = self.tabText(index)
+        if new_state:
+            self.setTabText(index, "★ " + text)
+            self.tabBar().setTabButton(index, QTabBar.ButtonPosition.RightSide, None)
+        else:
+            self.setTabText(index, text.replace("★ ", ""))
+
+    # --- CONTEXT MENU ---
+
+    def show_context_menu(self, pos):
+        tab_bar = self.tabBar()
+        if not tab_bar.geometry().contains(pos): return
+        
+        local_pos = tab_bar.mapFrom(self, pos)
+        index = tab_bar.tabAt(local_pos)
+        if index == -1: return
+
+        menu = QMenu(self)
+        
+        pinned = self.is_pinned(index)
+        action_pin = menu.addAction("Unpin Tab" if pinned else "Pin Tab")
+        action_pin.triggered.connect(lambda: self.toggle_pin(index))
+        
+        menu.addSeparator()
+        
+        action_close = menu.addAction("Close")
+        action_close.setEnabled(not pinned)
+        action_close.triggered.connect(lambda: self.close_tab_request(index))
+        
+        action_other = menu.addAction("Close Other Tabs")
+        action_other.triggered.connect(lambda: self.close_others(index))
+        
+        action_all = menu.addAction("Close All Unpinned")
+        action_all.triggered.connect(self.close_all_unpinned)
+
+        menu.exec(QCursor.pos())
+
+    def close_others(self, keep_index):
+        target_widget = self.widget(keep_index)
+        for i in range(self.count() - 1, -1, -1):
+            w = self.widget(i)
+            if w != target_widget and not self.is_pinned(i):
+                self.removeTab(i)
+                w.deleteLater()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            tab_bar = self.tabBar()
+            local_pos = tab_bar.mapFrom(self, event.pos())
+            index = tab_bar.tabAt(local_pos)
+            if index != -1:
+                self.close_tab_request(index)
+                return
+        super().mousePressEvent(event)
+
+    # --- PERSISTENCE ---
+
+    def save_state(self):
+        tabs = []
+        for i in range(self.count()):
+            raw_name = self.tabText(i)
+            is_pinned = self.is_pinned(i)
+            clean_name = raw_name.replace("★ ", "")
+            
+            tabs.append({
+                "name": clean_name,
+                "pinned": is_pinned,
+                "active": (i == self.currentIndex())
+            })
+        
+        self.config_manager.set_global("open_tabs", tabs)
+
+    def restore_state(self):
+        tabs = self.config_manager.get("open_tabs", default=[])
+        if not tabs: return
+        
+        for t in tabs:
+            new_grid = GridWidget(self.state_manager, self.config_manager)
+            
+            # Inject Data
+            if self.all_runs_df is not None:
+                new_grid.on_data_updated(self.all_runs_df)
+                
+            # Trigger Logic (Safe way)
+            new_grid.on_scenario_selected(t['name'])
+            
+            index = self.addTab(new_grid, t['name'])
+            if t['pinned']: self.toggle_pin(index)
+            if t['active']: self.setCurrentIndex(index)
+--- END OF FILE: modules\dashboard\grid_container.py ---
+

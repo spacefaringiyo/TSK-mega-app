@@ -1,0 +1,1723 @@
+// PART 2 //
+
+--- START OF FILE: modules\dashboard\grid_widget.py ---
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem, 
+                             QHeaderView, QLabel, QFrame, QHBoxLayout, 
+                             QAbstractItemView, QComboBox, QRadioButton, 
+                             QCheckBox, QButtonGroup, QMenu, QDialog, QListWidget, QPushButton)
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction, QColor, QCursor
+import pandas as pd
+import numpy as np
+import re
+from core import engine 
+from modules.dashboard import strategies
+from modules.dashboard.tooltip import CustomTooltip
+
+class ManageHiddenDialog(QDialog):
+    def __init__(self, hidden_scens, hidden_cms, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Hidden Items")
+        self.resize(400, 300)
+        self.hidden_scens = hidden_scens
+        self.hidden_cms = hidden_cms
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Hidden Scenarios:"))
+        self.list_scens = QListWidget()
+        self.list_scens.addItems(self.hidden_scens)
+        layout.addWidget(self.list_scens)
+        btn_unhide_scen = QPushButton("Unhide Selected Scenario")
+        btn_unhide_scen.clicked.connect(self.unhide_scen)
+        layout.addWidget(btn_unhide_scen)
+
+        layout.addWidget(QLabel("Hidden CMs (Global/Current):"))
+        self.list_cms = QListWidget()
+        self.list_cms.addItems(self.hidden_cms)
+        layout.addWidget(self.list_cms)
+        btn_unhide_cm = QPushButton("Unhide Selected CM")
+        btn_unhide_cm.clicked.connect(self.unhide_cm)
+        layout.addWidget(btn_unhide_cm)
+
+    def unhide_scen(self):
+        for item in self.list_scens.selectedItems():
+            self.hidden_scens.remove(item.text())
+            self.list_scens.takeItem(self.list_scens.row(item))
+
+    def unhide_cm(self):
+        for item in self.list_cms.selectedItems():
+            self.hidden_cms.remove(item.text())
+            self.list_cms.takeItem(self.list_cms.row(item))
+
+class GridWidget(QWidget):
+    def __init__(self, state_manager, config_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        self.config_manager = config_manager
+        
+        # Data State
+        self.all_runs_df = None
+        self.current_family_df = None
+        self.base_scenario_name = ""
+        self.is_loading_state = False
+        self.recent_data_map = {}
+        
+        self.agg_strategies = {cls.name: cls() for cls in strategies.AGGREGATION_MODES}
+        self.hl_strategies = {cls.name: cls() for cls in strategies.HIGHLIGHT_MODES}
+        self.active_agg = self.agg_strategies["Personal Best"]
+        self.active_hl = self.hl_strategies["Row Heatmap"]
+
+        self.hidden_scenarios = set()
+        self.hidden_cms = set()
+
+        self.agg_setting_widget = None
+        self.hl_setting_widget = None
+        self.format_checkboxes = {} 
+        self.current_axis = "Sens"
+        
+        self.tooltip = CustomTooltip(self)
+        self.tooltip.hide()
+
+        self.setup_ui()
+        
+        self.state_manager.data_updated.connect(self.on_data_updated)
+        self.state_manager.scenario_selected.connect(self.on_scenario_selected)
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(0)
+        
+        # ROW 1
+        self.row1 = self.create_toolbar_row("Compare by:")
+        self.axis_container = QHBoxLayout()
+        self.row1.layout().addLayout(self.axis_container)
+        self.row1.layout().addStretch()
+        self.axis_group = QButtonGroup(self)
+        self.axis_group.buttonClicked.connect(self.on_axis_changed)
+        layout.addWidget(self.row1)
+
+        # ROW 2
+        self.row2 = self.create_toolbar_row("Filter Format:")
+        self.format_container = QHBoxLayout()
+        self.row2.layout().addLayout(self.format_container)
+        self.row2.layout().addStretch()
+        layout.addWidget(self.row2)
+        self.row2.setVisible(False)
+
+        # ROW 3
+        self.row3 = self.create_toolbar_row("Sens Step:")
+        self.sens_combo = QComboBox()
+        self.sens_combo.addItems(["All", "2cm", "3cm", "5cm", "10cm"])
+        self.sens_combo.currentIndexChanged.connect(self.on_control_changed)
+        self.row3.layout().addWidget(self.sens_combo)
+        
+        self.row3.layout().addSpacing(20)
+        self.row3.layout().addWidget(QLabel("Mode:"))
+        
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.buttonClicked.connect(self.on_mode_changed)
+        for mode_cls in strategies.AGGREGATION_MODES:
+            btn = QRadioButton(mode_cls.name)
+            self.row3.layout().addWidget(btn)
+            self.mode_group.addButton(btn)
+            if mode_cls.name == "Personal Best": btn.setChecked(True)
+            
+        self.agg_setting_container = QHBoxLayout()
+        self.row3.layout().addLayout(self.agg_setting_container)
+        self.row3.layout().addStretch()
+        layout.addWidget(self.row3)
+
+        # ROW 4
+        self.row4 = self.create_toolbar_row("Highlight:")
+        self.hl_group = QButtonGroup(self)
+        self.hl_group.buttonClicked.connect(self.on_highlight_changed)
+        for hl_cls in strategies.HIGHLIGHT_MODES:
+            btn = QRadioButton(hl_cls.name)
+            self.row4.layout().addWidget(btn)
+            self.hl_group.addButton(btn)
+            if hl_cls.name == "Row Heatmap": btn.setChecked(True)
+
+        self.hl_setting_container = QHBoxLayout()
+        self.row4.layout().addLayout(self.hl_setting_container)
+        self.row4.layout().addStretch()
+        
+        btn_manage = QPushButton("Manage Hidden")
+        btn_manage.clicked.connect(self.open_manage_hidden)
+        self.row4.layout().addWidget(btn_manage)
+
+        layout.addWidget(self.row4)
+
+        # ROW 5
+        self.grid = QTableWidget()
+        self.grid.verticalHeader().setVisible(False)
+        self.grid.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.grid.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.grid.cellClicked.connect(self.on_cell_clicked)
+        self.grid.setMouseTracking(True)
+        self.grid.cellEntered.connect(self.on_cell_entered)
+        
+        self.grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.grid.customContextMenuRequested.connect(self.on_table_context_menu)
+        self.grid.horizontalHeader().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.grid.horizontalHeader().customContextMenuRequested.connect(self.on_header_context_menu)
+
+        layout.addWidget(self.grid)
+        self.update_strategy_widgets()
+
+    def create_toolbar_row(self, label_text):
+        frame = QFrame()
+        frame.setObjectName("Panel")
+        frame.setStyleSheet("border-bottom: 1px solid #363a45;")
+        lay = QHBoxLayout(frame)
+        lay.setContentsMargins(10, 5, 10, 5)
+        lay.addWidget(QLabel(label_text))
+        return frame
+
+    def leaveEvent(self, event):
+        self.tooltip.hide()
+        super().leaveEvent(event)
+
+    def focusOutEvent(self, event):
+        self.tooltip.hide()
+        super().focusOutEvent(event)
+
+    def on_data_updated(self, df): self.all_runs_df = df
+
+    def on_scenario_selected(self, scenario_name):
+        if self.all_runs_df is None: return
+        self.base_scenario_name = scenario_name
+        self.is_loading_state = True
+        
+        # 1. Title
+        # Fix: We removed self.title_lbl in the V2 layout (Toolbar rows replaced it)
+        # If you want a title, we can add it to Row 1 or rely on Tab Name.
+        # Current design relies on Tab Name.
+
+        # 2. Get Family
+        family_df = engine.get_scenario_family_info(self.all_runs_df, scenario_name)
+        if family_df is None or family_df.empty:
+            family_df = self.all_runs_df[self.all_runs_df['Scenario'] == scenario_name].copy()
+            family_df['Modifiers'] = [{}] * len(family_df)
+        self.current_family_df = family_df
+
+        # 3. Populate Axes
+        axes = set()
+        for mods in family_df['Modifiers']:
+            if isinstance(mods, dict): axes.update(mods.keys())
+        available_axes = sorted(list(axes))
+        if not available_axes: available_axes = ["Default"]
+        
+        for btn in self.axis_group.buttons():
+            self.axis_group.removeButton(btn)
+            btn.deleteLater()
+        
+        for axis in available_axes:
+            btn = QRadioButton(axis)
+            self.axis_container.addWidget(btn)
+            self.axis_group.addButton(btn)
+        
+        # Default Select
+        if self.axis_group.buttons():
+            self.axis_group.buttons()[0].setChecked(True)
+            self.current_axis = self.axis_group.buttons()[0].text()
+            self.rebuild_format_options()
+
+        self.load_view_settings()
+        self.is_loading_state = False
+        self.refresh_grid_view()
+
+    def on_axis_changed(self, btn):
+        if not btn: return
+        self.current_axis = btn.text()
+        self.rebuild_format_options()
+        if not self.is_loading_state: self.save_view_settings()
+        self.refresh_grid_view()
+
+    def rebuild_format_options(self):
+        patterns = set()
+        if self.current_family_df is not None:
+            for mods in self.current_family_df['Modifiers']:
+                if isinstance(mods, dict) and self.current_axis in mods:
+                    patterns.add(mods[self.current_axis][1])
+        
+        while self.format_container.count():
+            item = self.format_container.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        self.format_checkboxes = {}
+        
+        if len(patterns) > 1:
+            self.row2.setVisible(True)
+            for pat in patterns:
+                label = f"{self.current_axis} #" if pat == 'word_value' else (f"# {self.current_axis}" if pat == 'value_word' else "Standalone")
+                chk = QCheckBox(label)
+                chk.setChecked(True)
+                chk.stateChanged.connect(self.on_control_changed)
+                self.format_container.addWidget(chk)
+                self.format_checkboxes[pat] = chk
+        else:
+            self.row2.setVisible(False)
+
+    def on_mode_changed(self, btn):
+        self.active_agg = self.agg_strategies[btn.text()]
+        self.update_strategy_widgets()
+        self.on_control_changed()
+
+    def on_highlight_changed(self, btn):
+        self.active_hl = self.hl_strategies[btn.text()]
+        self.update_strategy_widgets()
+        self.on_control_changed()
+
+    def on_control_changed(self):
+        if not self.is_loading_state: self.save_view_settings()
+        self.refresh_grid_view()
+
+    def update_strategy_widgets(self):
+        for layout in [self.agg_setting_container, self.hl_setting_container]:
+            while layout.count():
+                item = layout.takeAt(0)
+                if item.widget(): item.widget().deleteLater()
+        
+        self.agg_setting_widget = self.active_agg.get_setting_widget()
+        if self.agg_setting_widget:
+            if hasattr(self.agg_setting_widget, 'valueChanged'):
+                self.agg_setting_widget.valueChanged.connect(self.on_control_changed)
+            self.agg_setting_container.addWidget(self.agg_setting_widget)
+
+        self.hl_setting_widget = self.active_hl.get_setting_widget()
+        if self.hl_setting_widget:
+            widget_to_bind = self.hl_setting_widget
+            if hasattr(widget_to_bind, 'spin'): widget_to_bind = widget_to_bind.spin
+            if hasattr(widget_to_bind, 'valueChanged'):
+                widget_to_bind.valueChanged.connect(self.on_control_changed)
+            self.hl_setting_container.addWidget(self.hl_setting_widget)
+
+    # --- PERSISTENCE ---
+    def load_view_settings(self):
+        settings = self.config_manager.get("grid_view", scenario=self.base_scenario_name, default={})
+        
+        self.hidden_scenarios = set(settings.get("hidden_scenarios", []))
+        self.hidden_cms = set(settings.get("hidden_cms", []))
+
+        if not settings: return
+
+        # 1. Restore Axis & REBUILD CHECKBOXES
+        if "axis" in settings:
+            for btn in self.axis_group.buttons():
+                if btn.text() == settings["axis"]: 
+                    btn.setChecked(True)
+                    self.current_axis = btn.text()
+                    self.rebuild_format_options() # CRITICAL FIX: Ensure boxes exist before unchecked
+                    break
+        
+        # 2. Restore Filter Format
+        saved_patterns = settings.get("disabled_patterns", [])
+        for pat, chk in self.format_checkboxes.items():
+            if pat in saved_patterns: chk.setChecked(False)
+
+        if "sens_step" in settings: self.sens_combo.setCurrentText(settings["sens_step"])
+
+        if "mode" in settings:
+            for btn in self.mode_group.buttons():
+                if btn.text() == settings["mode"]: 
+                    btn.setChecked(True); self.active_agg = self.agg_strategies[settings["mode"]]; break
+        
+        if "highlight" in settings:
+            for btn in self.hl_group.buttons():
+                if btn.text() == settings["highlight"]: 
+                    btn.setChecked(True); self.active_hl = self.hl_strategies[settings["highlight"]]; break
+        
+        self.update_strategy_widgets()
+        
+        if "agg_val" in settings and self.agg_setting_widget:
+            self.active_agg.set_setting_value(self.agg_setting_widget, settings["agg_val"])
+        if "hl_val" in settings and self.hl_setting_widget:
+            self.active_hl.set_setting_value(self.hl_setting_widget, settings["hl_val"])
+
+    def save_view_settings(self):
+        if not self.base_scenario_name: return
+        
+        disabled_pats = []
+        for pat, chk in self.format_checkboxes.items():
+            if not chk.isChecked(): disabled_pats.append(pat)
+
+        settings = {
+            "axis": self.current_axis,
+            "mode": self.active_agg.name,
+            "highlight": self.active_hl.name,
+            "sens_step": self.sens_combo.currentText(),
+            "hidden_scenarios": list(self.hidden_scenarios),
+            "hidden_cms": list(self.hidden_cms),
+            "disabled_patterns": disabled_pats
+        }
+        if self.agg_setting_widget:
+            settings["agg_val"] = self.active_agg.get_setting_value(self.agg_setting_widget)
+        if self.hl_setting_widget:
+            settings["hl_val"] = self.active_hl.get_setting_value(self.hl_setting_widget)
+            
+        self.config_manager.set_scenario(self.base_scenario_name, "grid_view", settings)
+
+    # --- CORE CALCULATION ---
+
+    def refresh_grid_view(self):
+        if self.current_family_df is None: return
+        df = self.current_family_df.copy()
+        
+        filtered_rows = []
+        for _, row in df.iterrows():
+            if row['Scenario'] in self.hidden_scenarios: continue
+
+            is_base = (row['Scenario'] == self.base_scenario_name)
+            mods = row['Modifiers']
+            keep = False
+            
+            if is_base: keep = True
+            elif isinstance(mods, dict) and self.current_axis in mods:
+                mod_keys = list(mods.keys())
+                remaining = [k for k in mod_keys if k != self.current_axis]
+                if len(remaining) == 0:
+                    val, pat = mods[self.current_axis]
+                    if pat in self.format_checkboxes:
+                        if self.format_checkboxes[pat].isChecked(): keep = True
+                    else: keep = True
+            if keep: filtered_rows.append(row)
+        
+        if not filtered_rows: self.grid.clear(); return
+        filtered_df = pd.DataFrame(filtered_rows)
+        
+        # Prepare ActiveAxis for grouping (visual pivot only)
+        if self.current_axis == "Sens": 
+            filtered_df['ActiveAxis'] = filtered_df['Sens']
+        else:
+            filtered_df['ActiveAxis'] = filtered_df['Modifiers'].apply(
+                lambda m: m[self.current_axis][0] if self.current_axis in m else np.nan)
+
+        setting_val = None
+        if self.agg_setting_widget:
+            setting_val = self.active_agg.get_setting_value(self.agg_setting_widget)
+        
+        summary = self.active_agg.calculate(filtered_df, setting_val)
+        pivot = summary.pivot_table(index='Scenario', columns='Sens', values='Score')
+
+        sens_filter = self.sens_combo.currentText()
+        step = 0
+        if sens_filter != "All":
+            try: step = float(sens_filter.replace("cm", ""))
+            except: pass
+            
+        cols = []
+        for c in pivot.columns:
+            if str(c) in self.hidden_cms or f"{c}cm" in self.hidden_cms: continue
+            if step > 0:
+                if self._is_step_match(c, step): cols.append(c)
+            else:
+                cols.append(c)
+                
+        pivot = pivot[cols]
+        pivot = self.sort_pivot_rows(pivot)
+
+        self.recent_data_map = {}
+        if self.active_hl.name == "Recent Success":
+            days = 14
+            if self.hl_setting_widget:
+                days = self.active_hl.get_setting_value(self.hl_setting_widget)
+            
+            cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
+            recent_df = self.current_family_df[self.current_family_df['Timestamp'] >= cutoff]
+            if not recent_df.empty:
+                self.recent_data_map = recent_df.groupby(['Scenario', 'Sens'])['Score'].max().to_dict()
+
+        self.populate_table(pivot)
+
+    def _is_step_match(self, col, step):
+        try:
+            val = float(col)
+            return abs(val % step) < 0.05 or abs((val % step)-step) < 0.05
+        except: return False
+
+    def sort_pivot_rows(self, pivot_df):
+        def key(name):
+            if name == self.base_scenario_name: return 100.0
+            mod = name.replace(self.base_scenario_name, "").strip()
+            nums = re.findall(r"(\d+\.?\d*)", mod)
+            return float(nums[-1]) if nums else 999.0
+        rows = list(pivot_df.index)
+        rows.sort(key=key)
+        return pivot_df.reindex(rows)
+
+    def populate_table(self, df):
+        self.grid.clear()
+        cols = sorted(df.columns, key=lambda x: float(x) if str(x).replace('.','').isdigit() else str(x))
+        headers = ["Scenario"] + [str(c) for c in cols] + ["AVG", "Best", "%"]
+        
+        self.grid.setRowCount(len(df) + 1)
+        self.grid.setColumnCount(len(headers))
+        self.grid.setHorizontalHeaderLabels(headers)
+        
+        header = self.grid.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        
+        if len(headers) > 1:
+            # Reverted to Stretch as requested
+            for i in range(1, len(headers)):
+                header.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+
+        avg_vals = {c: df[c].mean() for c in cols}
+        base_pb = 1.0
+        if self.base_scenario_name in df.index: base_pb = df.loc[self.base_scenario_name].max()
+
+        hl_setting = None
+        if self.hl_setting_widget:
+            hl_setting = self.active_hl.get_setting_value(self.hl_setting_widget)
+        
+        # ROW 0
+        self.grid.setItem(0,0, QTableWidgetItem("-- Average --"))
+        row_means_list = []
+        for i, c in enumerate(cols):
+            val = avg_vals.get(c, np.nan)
+            if pd.notna(val):
+                row_means_list.append(val)
+                it = QTableWidgetItem(f"{val:.1f}")
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                it.setBackground(QColor(40,44,52))
+                self.grid.setItem(0, i+1, it)
+        
+        if row_means_list:
+            self.grid.setItem(0, len(cols)+1, QTableWidgetItem(f"{np.mean(row_means_list):.1f}"))
+            self.grid.setItem(0, len(cols)+2, QTableWidgetItem(f"{np.max(row_means_list):.1f}"))
+
+        # DATA
+        row_idx = 1
+        for sc, row in df.iterrows():
+            self.grid.setItem(row_idx, 0, QTableWidgetItem(str(sc)))
+            vals = row.dropna().values
+            if len(vals) == 0:
+                for i, c in enumerate(cols): self.grid.setItem(row_idx, i+1, QTableWidgetItem("-"))
+                row_idx += 1
+                continue
+
+            ctx = {
+                'r_min': vals.min(), 'r_max': vals.max(),
+                'g_min': df.values.flatten()[~np.isnan(df.values.flatten())].min(),
+                'g_max': df.values.flatten()[~np.isnan(df.values.flatten())].max()
+            }
+
+            for i, c in enumerate(cols):
+                val = row.get(c, np.nan)
+                if pd.notna(val):
+                    it = QTableWidgetItem(f"{val:.0f}")
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    
+                    prev_item = self.grid.item(row_idx-1, i+1)
+                    if prev_item and prev_item.text() != "-" and prev_item.text():
+                        try: ctx['prev_val'] = float(prev_item.text())
+                        except: ctx['prev_val'] = None
+                    else: ctx['prev_val'] = None
+
+                    if self.active_hl.name == "Recent Success":
+                        ctx['recent_max'] = self.recent_data_map.get((sc, c))
+
+                    col = self.active_hl.get_color(val, ctx, hl_setting)
+                    if col: it.setBackground(col)
+                    self.grid.setItem(row_idx, i+1, it)
+                else:
+                    self.grid.setItem(row_idx, i+1, QTableWidgetItem("-"))
+            
+            self.grid.setItem(row_idx, len(cols)+1, QTableWidgetItem(f"{vals.mean():.1f}"))
+            self.grid.setItem(row_idx, len(cols)+2, QTableWidgetItem(f"{vals.max():.0f}"))
+            pct = (vals.max()/base_pb*100) if base_pb>0 else 0
+            self.grid.setItem(row_idx, len(cols)+3, QTableWidgetItem(f"{pct:.0f}%"))
+            row_idx += 1
+
+    # ... Context Menu handlers remain same ...
+    def on_table_context_menu(self, pos):
+        item = self.grid.itemAt(pos)
+        if not item: return
+        if item.column() != 0: return 
+        menu = QMenu(self)
+        hide_action = QAction(f"Hide Scenario: {item.text()}", self)
+        hide_action.triggered.connect(lambda: self.hide_scenario(item.text()))
+        menu.addAction(hide_action)
+        menu.exec(self.grid.viewport().mapToGlobal(pos))
+
+    def on_header_context_menu(self, pos):
+        idx = self.grid.horizontalHeader().logicalIndexAt(pos)
+        if idx <= 0: return 
+        header_text = self.grid.horizontalHeaderItem(idx).text()
+        if header_text in ["AVG", "Best", "%", "cm"]: return
+        menu = QMenu(self)
+        hide_action = QAction(f"Hide {header_text}", self)
+        hide_action.triggered.connect(lambda: self.hide_cm(header_text))
+        menu.addAction(hide_action)
+        menu.exec(self.grid.horizontalHeader().mapToGlobal(pos))
+
+    def hide_scenario(self, name):
+        self.hidden_scenarios.add(name)
+        self.save_view_settings()
+        self.refresh_grid_view()
+
+    def hide_cm(self, cm_text):
+        self.hidden_cms.add(cm_text)
+        self.save_view_settings()
+        self.refresh_grid_view()
+
+    def open_manage_hidden(self):
+        dlg = ManageHiddenDialog(list(self.hidden_scenarios), list(self.hidden_cms), self)
+        dlg.exec()
+        self.hidden_scenarios = set(dlg.hidden_scens)
+        self.hidden_cms = set(dlg.hidden_cms)
+        self.save_view_settings()
+        self.refresh_grid_view()
+
+    def on_cell_clicked(self, r, c):
+        item = self.grid.item(r, 0)
+        if item and item.text() != "-- Average --":
+            self.state_manager.variant_selected.emit(item.text())
+
+    def on_cell_entered(self, row, col):
+        if row < 0 or col < 0: self.tooltip.hide(); return
+        item_scen = self.grid.item(row, 0)
+        item_val = self.grid.item(row, col)
+        if not item_scen or not item_val or item_val.text() == "-": self.tooltip.hide(); return
+        scenario_name = item_scen.text()
+        if scenario_name == "-- Average --": self.tooltip.hide(); return
+        sens_str = self.grid.horizontalHeaderItem(col).text()
+        if self.current_family_df is None: return
+        df = self.current_family_df[self.current_family_df['Scenario'] == scenario_name]
+        try:
+            sens_val = float(sens_str)
+            df = df[df['Sens'] == sens_val]
+            sub_title = f"Sensitivity: {sens_val}cm"
+        except:
+            if col == 0: sub_title = "Sensitivity: All"
+            else: self.tooltip.hide(); return
+        if df.empty: self.tooltip.hide(); return
+        stats = engine.calculate_detailed_stats(df)
+        scores = df.sort_values('Timestamp')['Score'].tolist()
+        self.tooltip.update_data(scenario_name, sub_title, stats, scores)
+        cursor_pos = QCursor.pos()
+        self.tooltip.move(cursor_pos.x() + 20, cursor_pos.y() + 20)
+        self.tooltip.show()
+        self.tooltip.raise_()
+--- END OF FILE: modules\dashboard\grid_widget.py ---
+
+--- START OF FILE: modules\dashboard\strategies.py ---
+from PyQt6.QtWidgets import QSpinBox, QDoubleSpinBox, QWidget, QHBoxLayout, QLabel
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
+import pandas as pd
+import numpy as np
+
+# --- BASE CLASSES ---
+
+class StrategyBase:
+    name = "Base"
+    def get_setting_widget(self): return None
+    def get_setting_value(self, widget): return None
+    def set_setting_value(self, widget, value): pass
+
+class AggregationMode(StrategyBase):
+    def calculate(self, df, setting_val): pass
+
+class HighlightMode(StrategyBase):
+    def get_color(self, val, ctx, setting_val): pass
+
+# --- 1. AGGREGATION MODES ---
+
+# FIX: All modes now strictly group by ['Scenario', 'Sens']
+# This ensures the pivot table columns are always Sensitivities.
+
+class ModePB(AggregationMode):
+    name = "Personal Best"
+    def get_setting_widget(self):
+        sb = QSpinBox(); sb.setRange(1, 100); sb.setPrefix("#")
+        return sb
+    def get_setting_value(self, w): return w.value()
+    def set_setting_value(self, w, v): w.setValue(v)
+
+    def calculate(self, df, rank):
+        rank = rank if rank else 1
+        grouper = ['Scenario', 'Sens']
+        
+        if rank == 1:
+            return df.groupby(grouper)['Score'].max().reset_index()
+        
+        def get_nth(g): return g.nlargest(rank).iloc[-1] if len(g) >= rank else np.nan
+        return df.groupby(grouper)['Score'].apply(get_nth).reset_index()
+
+class ModeAvg(AggregationMode):
+    name = "Average Score"
+    def calculate(self, df, val):
+        return df.groupby(['Scenario', 'Sens'])['Score'].mean().reset_index()
+
+class ModeCount(AggregationMode):
+    name = "Play Count"
+    def calculate(self, df, val):
+        return df.groupby(['Scenario', 'Sens'])['Score'].size().reset_index()
+
+class ModePercentile(AggregationMode):
+    name = "Nth Percentile"
+    def get_setting_widget(self):
+        sb = QDoubleSpinBox(); sb.setRange(0, 100); sb.setValue(75.0); sb.setSuffix("%")
+        return sb
+    def get_setting_value(self, w): return w.value()
+    def set_setting_value(self, w, v): w.setValue(v)
+
+    def calculate(self, df, p):
+        p = (p / 100.0) if p else 0.75
+        return df.groupby(['Scenario', 'Sens'])['Score'].quantile(p).reset_index()
+
+# --- 2. HIGHLIGHT MODES ---
+
+class HLRowHeatmap(HighlightMode):
+    name = "Row Heatmap"
+    def get_color(self, val, ctx, setting):
+        r_min, r_max = ctx['r_min'], ctx['r_max']
+        if r_max <= r_min: return None
+        ratio = (val - r_min)/(r_max - r_min)
+        return get_traffic_light_color(ratio)
+
+class HLGlobalHeatmap(HighlightMode):
+    name = "Global Heatmap"
+    def get_color(self, val, ctx, setting):
+        g_min, g_max = ctx['g_min'], ctx['g_max']
+        if g_max <= g_min: return None
+        ratio = (val - g_min)/(g_max - g_min)
+        return get_traffic_light_color(ratio)
+
+class HLDrop(HighlightMode):
+    name = "Performance Drop"
+    def get_color(self, val, ctx, setting):
+        if ctx.get('prev_val') is not None:
+            if val < ctx['prev_val']:
+                return QColor(89, 32, 32) # Dark Red
+        return None
+
+class HLTarget(HighlightMode):
+    name = "Target Score"
+    def get_setting_widget(self):
+        sb = QDoubleSpinBox(); sb.setRange(0, 999999); sb.setValue(1000); sb.setPrefix("Target: ")
+        return sb
+    def get_setting_value(self, w): return w.value()
+    def set_setting_value(self, w, v): w.setValue(v)
+
+    def get_color(self, val, ctx, target):
+        if not target: target = 1000
+        if val >= target: return QColor(46, 105, 49)
+        g_min = ctx['g_min']
+        dist = max(0, val - g_min)
+        span = max(1, target - g_min)
+        return get_traffic_light_color(dist/span)
+    
+class HLRecent(HighlightMode):
+    name = "Recent Success"
+    def get_setting_widget(self):
+        # Return a container with Label + SpinBox
+        w = QWidget()
+        l = QHBoxLayout(w)
+        l.setContentsMargins(0,0,0,0)
+        l.addWidget(QLabel("Days:"))
+        sb = QSpinBox()
+        sb.setRange(1, 365); sb.setValue(14)
+        l.addWidget(sb)
+        # Store ref to sb so we can get value later
+        w.spin = sb
+        return w
+
+    def get_setting_value(self, w): return w.spin.value()
+    def set_setting_value(self, w, v): w.spin.setValue(v)
+
+    def get_color(self, val, ctx, setting):
+        recent = ctx.get('recent_max')
+        if recent is None or pd.isna(recent): return None
+        if recent >= val: return QColor(46, 105, 49)
+        else: return QColor(83, 31, 31)
+
+class HLNone(HighlightMode):
+    name = "None"
+    def get_color(self, val, ctx, setting): return None
+
+# --- UTILS ---
+def get_traffic_light_color(ratio):
+    ratio = max(0.0, min(1.0, ratio))
+    c_red = np.array([120, 47, 47])
+    c_yel = np.array([122, 118, 50])
+    c_grn = np.array([54, 107, 54])
+    
+    if ratio < 0.5:
+        local_r = ratio * 2
+        res = (1 - local_r) * c_red + local_r * c_yel
+    else:
+        local_r = (ratio - 0.5) * 2
+        res = (1 - local_r) * c_yel + local_r * c_grn
+    return QColor(int(res[0]), int(res[1]), int(res[2]))
+
+AGGREGATION_MODES = [ModePB, ModePercentile, ModeAvg, ModeCount]
+HIGHLIGHT_MODES = [HLRowHeatmap, HLGlobalHeatmap, HLDrop, HLTarget, HLRecent, HLNone]
+--- END OF FILE: modules\dashboard\strategies.py ---
+
+--- START OF FILE: modules\dashboard\tooltip.py ---
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame, QGraphicsDropShadowEffect
+from PyQt6.QtCore import Qt, QPoint, QSize
+from PyQt6.QtGui import QPainter, QColor, QPen, QPainterPath
+
+class SparklineWidget(QWidget):
+    def __init__(self, scores, avg, p75):
+        super().__init__()
+        self.setMinimumHeight(80)
+        self.setMinimumWidth(280)
+        self.scores = scores
+        self.avg = avg
+        self.p75 = p75
+        self.setStyleSheet("background: transparent;")
+
+    def sizeHint(self): return QSize(280, 80)
+
+    def paintEvent(self, event):
+        if not self.scores or len(self.scores) < 2: return
+        
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        padding = 10
+        min_val, max_val = min(self.scores), max(self.scores)
+        rng = max_val - min_val if max_val > min_val else 1.0
+        
+        def get_y(val): return h - padding - (((val - min_val) / rng) * (h - 2*padding))
+        def get_x(idx): return padding + (idx / (len(self.scores) - 1)) * (w - 2*padding)
+
+        # Draw Avg (Grey Dashed)
+        y_avg = get_y(self.avg)
+        pen_avg = QPen(QColor("#787b86"), 1, Qt.PenStyle.DashLine)
+        painter.setPen(pen_avg)
+        painter.drawLine(int(padding), int(y_avg), int(w-padding), int(y_avg))
+
+        # Draw p75 (Green Dashed) - ALWAYS DRAW
+        y_p75 = get_y(self.p75)
+        pen_p75 = QPen(QColor("#4CAF50"), 1, Qt.PenStyle.DashLine)
+        painter.setPen(pen_p75)
+        painter.drawLine(int(padding), int(y_p75), int(w-padding), int(y_p75))
+
+        # Draw Line
+        path = QPainterPath()
+        path.moveTo(get_x(0), get_y(self.scores[0]))
+        for i, val in enumerate(self.scores): path.lineTo(get_x(i), get_y(val))
+        painter.setPen(QPen(QColor("#4aa3df"), 2))
+        painter.drawPath(path)
+
+        # Draw Max Dot
+        max_idx = self.scores.index(max_val)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#FFD700"))
+        painter.drawEllipse(QPoint(int(get_x(max_idx)), int(get_y(max_val))), 4, 4)
+
+class CustomTooltip(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # REMOVED: WA_TranslucentBackground (This caused the see-through ghosting)
+        self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        
+        # Solid Styling
+        self.setStyleSheet("""
+            QFrame {
+                background-color: #1e1e1e;
+                border: 1px solid #485c7b;
+                border-radius: 4px;
+            }
+            QLabel { background: transparent; color: #d1d4dc; border: none; }
+        """)
+        
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(12, 12, 12, 12)
+        self.layout.setSpacing(4)
+
+        self.lbl_title = QLabel()
+        self.lbl_title.setStyleSheet("font-weight: bold; color: #4aa3df; font-size: 13px;")
+        self.layout.addWidget(self.lbl_title)
+        
+        self.lbl_sub = QLabel()
+        self.lbl_sub.setStyleSheet("font-weight: bold; color: #FF9800; font-size: 12px;")
+        self.layout.addWidget(self.lbl_sub)
+        
+        self.layout.addWidget(self.create_line())
+        
+        self.lbl_pb = QLabel()
+        self.layout.addWidget(self.lbl_pb)
+        self.lbl_stats = QLabel()
+        self.layout.addWidget(self.lbl_stats)
+        self.lbl_med = QLabel()
+        self.layout.addWidget(self.lbl_med)
+        
+        self.layout.addWidget(self.create_line())
+        
+        self.lbl_launchpad = QLabel()
+        self.layout.addWidget(self.lbl_launchpad)
+        self.lbl_recent = QLabel()
+        self.layout.addWidget(self.lbl_recent)
+        
+        self.spark_container = QVBoxLayout()
+        self.layout.addLayout(self.spark_container)
+
+    def create_line(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Plain)
+        line.setStyleSheet("color: #363a45;")
+        return line
+
+    def update_data(self, title, sub_title, stats, runs):
+        self.lbl_title.setText(title)
+        self.lbl_sub.setText(sub_title)
+        
+        pb_date = stats['pb_date'].strftime('%Y-%m-%d')
+        sens_str = f" ({stats.get('pb_sens')}cm)" if stats.get('pb_sens') else ""
+        self.lbl_pb.setText(f"PB: {stats['max']:.1f}{sens_str} (on {pb_date})")
+        
+        self.lbl_stats.setText(f"Runs: {stats['count']} | Avg: {stats['avg']:.1f} (±{stats['std']:.1f})")
+        self.lbl_med.setText(f"Median: {stats['p50']:.1f} | 75th: {stats['p75']:.1f}")
+        
+        self.lbl_launchpad.setText(f"Avg before prev PB: {stats['launchpad_avg']:.1f}")
+        self.lbl_recent.setText(f"Recent Avg: {stats.get('recent_avg', 0):.1f}")
+        
+        while self.spark_container.count():
+            child = self.spark_container.takeAt(0)
+            if child.widget(): child.widget().deleteLater()
+            
+        if len(runs) > 200: runs = runs[::(len(runs)//200)]
+        spark = SparklineWidget(runs, stats['avg'], stats['p75'])
+        self.spark_container.addWidget(spark)
+        self.adjustSize()
+--- END OF FILE: modules\dashboard\tooltip.py ---
+
+--- START OF FILE: modules\navigation\browser_tabs.py ---
+from PyQt6.QtWidgets import QTabWidget, QWidget, QVBoxLayout, QLabel
+from modules.navigation.sidebar import NavigationWidget
+
+class BrowserTabs(QTabWidget):
+    def __init__(self, state_manager, config_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        
+        # 1. Scenarios
+        # Pass config_manager directly
+        self.scenarios_tab = NavigationWidget(state_manager, config_manager)
+        self.addTab(self.scenarios_tab, "Scenarios")
+        
+        # 2. Playlists
+        self.playlists_tab = QWidget()
+        pl_layout = QVBoxLayout(self.playlists_tab)
+        pl_layout.addWidget(QLabel("Playlists (Coming Soon)"))
+        self.addTab(self.playlists_tab, "Playlists")
+        
+        # 3. Benchmarks
+        self.benchmarks_tab = QWidget()
+        bm_layout = QVBoxLayout(self.benchmarks_tab)
+        bm_layout.addWidget(QLabel("Benchmarks (Coming Soon)"))
+        self.addTab(self.benchmarks_tab, "Benchmarks")
+        
+        self.setStyleSheet("""
+            QTabBar::tab {
+                background: #1e222d;
+                color: #787b86;
+                padding: 8px 12px;
+                border-bottom: 1px solid #363a45;
+            }
+            QTabBar::tab:selected {
+                background: #131722;
+                color: #d1d4dc;
+                border-bottom: 2px solid #2962FF;
+            }
+            QTabWidget::pane { border: none; background: #131722; }
+        """)
+--- END OF FILE: modules\navigation\browser_tabs.py ---
+
+--- START OF FILE: modules\navigation\sidebar.py ---
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLineEdit, QTreeWidget, 
+                             QTreeWidgetItem, QLabel, QFrame, QMenu)
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction
+
+class NavigationWidget(QWidget):
+    def __init__(self, state_manager, config_manager=None):
+        super().__init__()
+        self.state_manager = state_manager
+        self.config_manager = config_manager # Stores it
+        self.scenario_list = []
+        self.setup_ui()
+        
+        self.state_manager.data_updated.connect(self.on_data_updated)
+        
+        if self.config_manager:
+            self.refresh_favorites()
+
+    # Added config_manager to init signature
+    #removed to to above change
+    #def set_config_manager(self, cfg):
+    #   self.config_manager = cfg
+    #    self.refresh_favorites()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Filter Scenarios...")
+        self.search_bar.textChanged.connect(self.on_search_text_changed)
+        self.search_bar.returnPressed.connect(self.on_enter_pressed)
+        layout.addWidget(self.search_bar)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setIndentation(20)
+        self.tree.itemClicked.connect(self.on_item_clicked)
+        
+        # Context Menu
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_context_menu)
+        
+        layout.addWidget(self.tree)
+
+        self.favorites_root = QTreeWidgetItem(self.tree, ["Favorites"])
+        self.favorites_root.setExpanded(True)
+        
+        self.recents_root = QTreeWidgetItem(self.tree, ["Recently Played"])
+        self.recents_root.setExpanded(True)
+
+        self.all_root = QTreeWidgetItem(self.tree, ["All Scenarios"])
+        self.all_root.setExpanded(True)
+
+    def on_data_updated(self, df):
+        if df is None: return
+        self.scenario_list = sorted(df['Scenario'].unique())
+        
+        self.all_root.takeChildren()
+        for scen in self.scenario_list:
+            QTreeWidgetItem(self.all_root, [scen])
+            
+        self.recents_root.takeChildren()
+        recent_df = df.sort_values('Timestamp', ascending=False)
+        # CHANGED: 10 -> 25
+        recents = recent_df['Scenario'].drop_duplicates().head(25).tolist()
+        for scen in recents:
+            QTreeWidgetItem(self.recents_root, [scen])
+            
+        if hasattr(self, 'config_manager'):
+            self.refresh_favorites()
+
+    def refresh_favorites(self):
+        if not hasattr(self, 'config_manager'): return
+        favs = self.config_manager.get_favorites()
+        self.favorites_root.takeChildren()
+        for f in favs:
+            QTreeWidgetItem(self.favorites_root, [f])
+
+    def show_context_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if not item: return
+        
+        # Only allow favoriting scenarios (leaf nodes)
+        if item.childCount() > 0: return 
+        
+        scenario_name = item.text(0)
+        is_fav = self.config_manager.is_favorite(scenario_name)
+        
+        menu = QMenu(self)
+        action_text = "Remove from Favorites" if is_fav else "Add to Favorites"
+        action = QAction(action_text, self)
+        action.triggered.connect(lambda: self.toggle_favorite(scenario_name))
+        menu.addAction(action)
+        
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def toggle_favorite(self, name):
+        if self.config_manager.is_favorite(name):
+            self.config_manager.remove_favorite(name)
+        else:
+            self.config_manager.add_favorite(name)
+        self.refresh_favorites()
+
+    def on_search_text_changed(self, text):
+        search_text = text.lower()
+        child_count = self.all_root.childCount()
+        for i in range(child_count):
+            item = self.all_root.child(i)
+            item.setHidden(search_text not in item.text(0).lower())
+
+    def on_enter_pressed(self):
+        child_count = self.all_root.childCount()
+        for i in range(child_count):
+            item = self.all_root.child(i)
+            if not item.isHidden():
+                self.state_manager.scenario_selected.emit(item.text(0))
+                self.tree.setCurrentItem(item)
+                return
+
+    def on_item_clicked(self, item, column):
+        if item.childCount() > 0: return 
+        self.state_manager.scenario_selected.emit(item.text(0))
+--- END OF FILE: modules\navigation\sidebar.py ---
+
+--- START OF FILE: modules\right_panel\analyst_tabs.py ---
+from PyQt6.QtWidgets import QTabWidget, QWidget, QVBoxLayout, QLabel
+from modules.right_panel.ongoing import OngoingWidget
+from modules.session.session_manager import SessionManager
+from modules.career.career_widget import CareerWidget
+
+class AnalystTabs(QTabWidget):
+    def __init__(self, state_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        
+        # 1. Ongoing (Placeholder for next step)
+        # 1. Ongoing
+        self.ongoing_tab = OngoingWidget(state_manager)
+        self.addTab(self.ongoing_tab, "Ongoing")
+        
+        # 2. Session (Drill Down Manager)
+        self.session_tab = SessionManager(state_manager)
+        self.addTab(self.session_tab, "Session Report")
+        
+        # 3. Career
+        self.career_tab = CareerWidget(state_manager)
+        self.addTab(self.career_tab, "Career Profile")
+        
+        self.setStyleSheet("""
+            QTabBar::tab {
+                background: #1e222d;
+                color: #787b86;
+                padding: 8px 12px;
+                border-bottom: 1px solid #363a45;
+            }
+            QTabBar::tab:selected {
+                background: #131722;
+                color: #d1d4dc;
+                border-bottom: 2px solid #2962FF;
+            }
+            QTabWidget::pane { border: none; background: #131722; }
+        """)
+--- END OF FILE: modules\right_panel\analyst_tabs.py ---
+
+--- START OF FILE: modules\right_panel\ongoing.py ---
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, 
+                             QTableWidgetItem, QHeaderView, QLabel, QFrame, 
+                             QRadioButton, QButtonGroup, QAbstractItemView)
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
+import pandas as pd
+from modules.charts.chart_widget import ChartWidget
+from core import engine
+
+class OngoingWidget(QWidget):
+    def __init__(self, state_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        self.full_df = None
+        self.recent_runs = []
+        
+        # Caches
+        self.stats_cache_avg = {}
+        self.stats_cache_75 = {}
+        self.stats_cache_pb = {} # New: PB Cache
+
+        # Graph State
+        self.graph_baseline = "Avg" 
+
+        self.setup_ui()
+        self.state_manager.data_updated.connect(self.on_data_updated)
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        
+        # 1. GRAPH
+        self.chart = ChartWidget(self.state_manager, listen_to_global_signals=False)
+        self.chart.setMinimumHeight(250)
+        layout.addWidget(self.chart, stretch=2)
+
+        # 2. CONTROLS (Graph Only)
+        controls = QFrame()
+        controls.setStyleSheet("background: #1e222d; border-top: 1px solid #363a45; border-bottom: 1px solid #363a45;")
+        c_layout = QHBoxLayout(controls)
+        c_layout.setContentsMargins(10, 5, 10, 5)
+        
+        c_layout.addWidget(QLabel("Graph Baseline:"))
+        self.rb_avg = QRadioButton("Average")
+        self.rb_75 = QRadioButton("75th %")
+        self.rb_avg.setChecked(True)
+        
+        self.bg_group = QButtonGroup()
+        self.bg_group.addButton(self.rb_avg)
+        self.bg_group.addButton(self.rb_75)
+        self.bg_group.buttonClicked.connect(self.on_graph_baseline_changed)
+        
+        c_layout.addWidget(self.rb_avg)
+        c_layout.addWidget(self.rb_75)
+        c_layout.addStretch()
+        layout.addWidget(controls)
+
+        # 3. TABLE (Expanded)
+        self.table = QTableWidget()
+        columns = ["Scenario", "Sens", "Score", "vs Avg", "vs 75th", "vs PB"]
+        self.table.setColumnCount(len(columns))
+        self.table.setHorizontalHeaderLabels(columns)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        
+        # Sizing
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch) # Name gets space
+        for i in range(1, len(columns)):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents) # Others compact
+        
+        layout.addWidget(self.table, stretch=3)
+
+    def on_data_updated(self, df):
+        if df is None: return
+        self.full_df = df
+        
+        # 1. Pre-calculate Stats
+        grouped = df.groupby(['Scenario', 'Sens'])['Score']
+        self.stats_cache_avg = grouped.mean().to_dict()
+        self.stats_cache_75 = grouped.quantile(0.75).to_dict()
+        self.stats_cache_pb = grouped.max().to_dict()
+        
+        # 2. Get Last 50 Runs
+        self.recent_runs = df.sort_values('Timestamp', ascending=False).head(50)
+        self.refresh_view()
+
+    def on_graph_baseline_changed(self, btn):
+        self.graph_baseline = "Avg" if self.rb_avg.isChecked() else "75th"
+        self.refresh_view()
+
+    def refresh_view(self):
+        if self.full_df is None: return
+        
+        graph_points = []
+        
+        self.table.setRowCount(len(self.recent_runs))
+        
+        # Iterate (Newest is index 0 in recent_runs)
+        for row_idx, (idx, row) in enumerate(self.recent_runs.iterrows()):
+            key = (row['Scenario'], row['Sens'])
+            score = row['Score']
+            
+            # Lookup Stats
+            val_avg = self.stats_cache_avg.get(key, 0)
+            val_75 = self.stats_cache_75.get(key, 0)
+            val_pb = self.stats_cache_pb.get(key, 0)
+            
+            # --- POPULATE TABLE ---
+            # 0: Name
+            self.table.setItem(row_idx, 0, QTableWidgetItem(row['Scenario']))
+            # 1: Sens
+            self.table.setItem(row_idx, 1, QTableWidgetItem(f"{row['Sens']}cm"))
+            # 2: Score
+            self.table.setItem(row_idx, 2, QTableWidgetItem(f"{score:.0f}"))
+            
+            # Helpers for vs Columns
+            def set_vs_cell(col_idx, baseline, baseline_label):
+                if baseline > 0:
+                    pct = ((score - baseline) / baseline) * 100
+                    item = QTableWidgetItem(f"{pct:+.1f}%")
+                    
+                    # Color
+                    if pct > 0: item.setForeground(QColor("#4CAF50"))
+                    elif pct < 0: item.setForeground(QColor("#EF5350"))
+                    else: item.setForeground(QColor("#787b86")) # Grey for 0
+                    
+                    # Tooltip
+                    item.setToolTip(f"Score: {score:.0f}\n{baseline_label}: {baseline:.1f}\nDiff: {pct:+.1f}%")
+                    self.table.setItem(row_idx, col_idx, item)
+                else:
+                    self.table.setItem(row_idx, col_idx, QTableWidgetItem("-"))
+
+            set_vs_cell(3, val_avg, "Average")
+            set_vs_cell(4, val_75, "75th Percentile")
+            set_vs_cell(5, val_pb, "Personal Best")
+
+            # --- PREPARE GRAPH DATA ---
+            # Graph uses the selected baseline (Radio Button)
+            base_for_graph = val_avg if self.graph_baseline == "Avg" else val_75
+            graph_pct = 0.0
+            if base_for_graph > 0:
+                graph_pct = ((score - base_for_graph) / base_for_graph) * 100
+            
+            graph_points.append({
+                'time': int(row['Timestamp'].timestamp()),
+                'value': graph_pct,
+                'label': row['Scenario']
+            })
+
+        # --- PLOT GRAPH ---
+        # Sort chronologically (Oldest -> Newest)
+        graph_points.sort(key=lambda x: x['time'])
+        
+        # Markers
+        markers = []
+        last_scen = None
+        for p in graph_points:
+            if p['label'] != last_scen:
+                markers.append({
+                    'time': p['time'],
+                    'position': 'aboveBar',
+                    'color': '#FF9800',
+                    'shape': 'arrowDown',
+                    'text': p['label']
+                })
+                last_scen = p['label']
+
+        payload = [{
+            'id': 'ongoing_perf',
+            'color': '#4aa3df',
+            'width': 2,
+            'data': graph_points,
+            'markers': markers
+        }]
+        self.chart.plot_payload(payload)
+--- END OF FILE: modules\right_panel\ongoing.py ---
+
+--- START OF FILE: modules\session\session_list.py ---
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QListWidget, QListWidgetItem, 
+                             QLabel, QFrame)
+from PyQt6.QtCore import Qt
+import pandas as pd
+
+class SessionListWidget(QWidget):
+    def __init__(self, state_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        self.setup_ui()
+        self.state_manager.data_updated.connect(self.on_data_updated)
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        
+        lbl = QLabel("History")
+        lbl.setStyleSheet("font-weight: bold; padding: 10px;")
+        layout.addWidget(lbl)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setStyleSheet("border: none;")
+        self.list_widget.itemClicked.connect(self.on_item_clicked)
+        layout.addWidget(self.list_widget)
+
+    def on_data_updated(self, df):
+        if df is None or 'SessionID' not in df.columns: return
+        self.list_widget.clear()
+        
+        sessions = df.groupby('SessionID').agg(
+            StartTime=('Timestamp', 'min'),
+            Count=('Score', 'size'),
+            Duration=('Duration', 'sum')
+        ).sort_index(ascending=False)
+
+        for sess_id, row in sessions.iterrows():
+            date_str = row['StartTime'].strftime('%Y-%m-%d %H:%M')
+            duration_min = int(row['Duration'] // 60)
+            label = f"#{int(sess_id)} - {date_str}\n{row['Count']} Runs ({duration_min}m)"
+            
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, int(sess_id))
+            self.list_widget.addItem(item)
+
+    def on_item_clicked(self, item):
+        sess_id = item.data(Qt.ItemDataRole.UserRole)
+        # FIX: Send the signal now!
+        self.state_manager.session_selected.emit(sess_id)
+--- END OF FILE: modules\session\session_list.py ---
+
+--- START OF FILE: modules\session\session_manager.py ---
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QStackedWidget, QPushButton, QHBoxLayout, QLabel, QFrame
+from PyQt6.QtCore import Qt
+from modules.session.session_list import SessionListWidget
+from modules.session.session_report import SessionReportWidget
+
+class SessionManager(QWidget):
+    def __init__(self, state_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        
+        # HEADER (Back Button + Title)
+        self.header = QFrame()
+        self.header.setStyleSheet("background: #1e222d; border-bottom: 1px solid #363a45;")
+        self.header.setFixedHeight(40)
+        h_layout = QHBoxLayout(self.header)
+        h_layout.setContentsMargins(5,0,5,0)
+        
+        self.btn_back = QPushButton("← History")
+        self.btn_back.setStyleSheet("border: none; font-weight: bold; color: #2962FF;")
+        self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_back.clicked.connect(self.go_to_list)
+        self.btn_back.setVisible(False) # Hidden initially
+        
+        self.lbl_title = QLabel("Session History")
+        self.lbl_title.setStyleSheet("font-weight: bold; color: #d1d4dc;")
+        
+        h_layout.addWidget(self.btn_back)
+        h_layout.addStretch()
+        h_layout.addWidget(self.lbl_title)
+        h_layout.addStretch()
+        
+        layout.addWidget(self.header)
+
+        # STACK (Pages)
+        self.stack = QStackedWidget()
+        
+        # Page 1: List
+        self.page_list = SessionListWidget(state_manager)
+        # We need to intercept the click signal!
+        # The list emits a signal to StateManager. We can listen to that.
+        self.state_manager.session_selected.connect(self.go_to_report)
+        
+        # Page 2: Report
+        self.page_report = SessionReportWidget(state_manager)
+        
+        self.stack.addWidget(self.page_list)
+        self.stack.addWidget(self.page_report)
+        
+        layout.addWidget(self.stack)
+
+    def go_to_report(self, session_id):
+        # User clicked a session -> Slide to Report
+        self.stack.setCurrentWidget(self.page_report)
+        self.btn_back.setVisible(True)
+        self.lbl_title.setText(f"Session #{int(session_id)}")
+
+    def go_to_list(self):
+        # User clicked Back -> Slide to List
+        self.stack.setCurrentWidget(self.page_list)
+        self.btn_back.setVisible(False)
+        self.lbl_title.setText("Session History")
+--- END OF FILE: modules\session\session_manager.py ---
+
+--- START OF FILE: modules\session\session_report.py ---
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, 
+                             QCheckBox, QScrollArea, QSizePolicy, QRadioButton, QButtonGroup)
+from PyQt6.QtCore import Qt
+import pandas as pd
+from core import engine
+from modules.charts.chart_widget import ChartWidget
+from modules.charts import indicators
+
+class SessionReportWidget(QWidget):
+    def __init__(self, state_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        self.full_df = None
+        self.summary = None
+        self.view_mode = 'grid' 
+
+        self.setup_ui()
+        
+        self.state_manager.data_updated.connect(self.on_data_updated)
+        if hasattr(self.state_manager, 'session_selected'):
+            self.state_manager.session_selected.connect(self.on_session_selected)
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0,0,0,0)
+        
+        # 1. HEADER
+        self.header = QFrame()
+        self.header.setStyleSheet("background: #1e222d; border-bottom: 1px solid #363a45;")
+        self.header.setFixedHeight(80)
+        self.header_layout = QHBoxLayout(self.header)
+        main_layout.addWidget(self.header)
+        
+        # 2. CONTROLS
+        controls = QFrame()
+        c_layout = QHBoxLayout(controls)
+        c_layout.setContentsMargins(10,5,10,5)
+        
+        self.chk_trend = QCheckBox("Trend"); self.chk_trend.setChecked(True)
+        self.chk_flow = QCheckBox("Flow"); self.chk_flow.setChecked(True)
+        self.chk_pulse = QCheckBox("Pulse")
+        
+        for chk in [self.chk_trend, self.chk_flow, self.chk_pulse]:
+            chk.stateChanged.connect(self.refresh_view)
+            c_layout.addWidget(chk)
+            
+        c_layout.addSpacing(30)
+        
+        c_layout.addWidget(QLabel("Summarize by:"))
+        self.rb_grid = QRadioButton("Grid (Scenario + Sens)")
+        self.rb_scen = QRadioButton("Scenario Only")
+        self.rb_grid.setChecked(True)
+        
+        self.view_group = QButtonGroup()
+        self.view_group.addButton(self.rb_grid)
+        self.view_group.addButton(self.rb_scen)
+        self.view_group.buttonClicked.connect(self.on_view_toggle)
+        
+        c_layout.addWidget(self.rb_grid)
+        c_layout.addWidget(self.rb_scen)
+        c_layout.addStretch()
+        main_layout.addWidget(controls)
+
+        # 3. CHART (ISOLATED)
+        # Fix: Stop listening to global grid clicks!
+        self.chart = ChartWidget(self.state_manager, listen_to_global_signals=False)
+        self.chart.setMinimumHeight(300)
+        main_layout.addWidget(self.chart, stretch=2)
+
+        # 4. LISTS
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("background: #131722; border: none;")
+        self.scroll_content = QWidget()
+        self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_layout.setContentsMargins(10, 10, 10, 10)
+        self.scroll_layout.setSpacing(10)
+        self.scroll.setWidget(self.scroll_content)
+        main_layout.addWidget(self.scroll, stretch=3)
+
+    def on_data_updated(self, df): self.full_df = df
+
+    def on_session_selected(self, session_id):
+        if self.full_df is None: return
+        session_df = self.full_df[self.full_df['SessionID'] == session_id].copy()
+        
+        self.summary = engine.analyze_session(session_df, self.full_df)
+        if not self.summary: return
+        
+        self.refresh_view()
+
+    def on_view_toggle(self, btn):
+        self.view_mode = 'scenario' if self.rb_scen.isChecked() else 'grid'
+        self.refresh_view()
+
+    def refresh_view(self):
+        if not self.summary: return
+        data = self.summary[self.view_mode]
+        meta = self.summary['meta']
+        
+        self.refresh_metrics(meta, data['pb_count'])
+        self.plot_graph(data['graph_data'])
+        self.render_lists(data['lists'])
+
+    def refresh_metrics(self, meta, pb_count):
+        while self.header_layout.count(): 
+            child = self.header_layout.takeAt(0)
+            if child.widget(): child.widget().deleteLater()
+            
+        def add_metric(label, val):
+            vbox = QVBoxLayout()
+            l1 = QLabel(label); l1.setStyleSheet("color: #787b86; font-size: 10px;")
+            l2 = QLabel(str(val)); l2.setStyleSheet("font-size: 16px; font-weight: bold;")
+            vbox.addWidget(l1); vbox.addWidget(l2)
+            self.header_layout.addLayout(vbox)
+            self.header_layout.addSpacing(20)
+
+        add_metric("Date", meta['date_str'])
+        add_metric("Duration", meta['duration_str'])
+        add_metric("Active", meta['active_str'])
+        add_metric("Plays", meta['play_count'])
+        add_metric("PBs", pb_count)
+
+    def plot_graph(self, graph_data):
+        payload = []
+        
+        # 1. GENERATE MARKERS (LABELS)
+        # We scan the data. If the scenario/sens changes, we add a label.
+        markers = []
+        last_label = None
+        
+        for d in graph_data:
+            # Determine label text based on view mode logic
+            # Engine passes 'scenario' and 'sens' in data
+            label_text = d['scenario']
+            if d['sens']: label_text += f" ({d['sens']}cm)"
+            
+            if label_text != last_label:
+                markers.append({
+                    'time': d['time'],
+                    'position': 'aboveBar',
+                    'color': '#FF9800', # Orange text
+                    'shape': 'arrowDown',
+                    'text': label_text
+                })
+                last_label = label_text
+
+        # 2. Main Score Line
+        scores = [{'time': d['time'], 'value': d['pct']} for d in graph_data]
+        payload.append({
+            'id': 'score', 
+            'color': '#4aa3df', 
+            'width': 2, 
+            'data': scores,
+            'markers': markers # Pass markers here
+        })
+        
+        # 3. Indicators
+        if self.chk_trend.isChecked(): payload.append(self.get_ind(indicators.IndTrend, graph_data))
+        if self.chk_flow.isChecked(): payload.append(self.get_ind(indicators.IndFlow, graph_data))
+        if self.chk_pulse.isChecked(): payload.append(self.get_ind(indicators.IndPulse, graph_data))
+        
+        self.chart.plot_payload(payload)
+
+    def get_ind(self, cls, data):
+        inst = cls()
+        return {'id': inst.name, 'color': inst.color, 'width': inst.width, 'data': inst.extract_data(data)}
+
+    # ... (Render Lists logic remains the same as previous) ...
+    def render_lists(self, lists):
+        while self.scroll_layout.count():
+            item = self.scroll_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        if lists['pbs']:
+            self.add_header(f"Personal Bests ({len(lists['pbs'])})", "#4CAF50")
+            for item in lists['pbs']: self.add_pb_card(item)
+
+        if lists['avgs']:
+            self.add_header("Average Comparison", "#FF9800")
+            for item in lists['avgs']: self.add_avg_card(item)
+
+        self.add_header("Scenarios Played", "#2962FF")
+        for item in lists['played']: self.add_played_card(item)
+            
+        self.scroll_layout.addStretch()
+
+    def add_header(self, text, color):
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 14px; margin-top: 10px; border-bottom: 1px solid #363a45; padding-bottom: 5px;")
+        self.scroll_layout.addWidget(lbl)
+
+    def add_pb_card(self, item):
+        frame = QFrame()
+        frame.setStyleSheet("background: #1e222d; border-radius: 4px; border-left: 3px solid #4CAF50;")
+        layout = QHBoxLayout(frame)
+        name = item['name']
+        if item.get('sens'): name += f" ({item['sens']}cm)"
+        layout.addWidget(QLabel(name))
+        layout.addStretch()
+        detail = f"New: {item['score']:.0f} (Prev: {item['prev']:.0f})"
+        diff = f"+{item['imp']:.0f} (+{item['imp_pct']:.1f}%)"
+        layout.addWidget(QLabel(detail))
+        layout.addSpacing(15)
+        lbl_diff = QLabel(diff); lbl_diff.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        layout.addWidget(lbl_diff)
+        self.scroll_layout.addWidget(frame)
+
+    def add_avg_card(self, item):
+        frame = QFrame()
+        frame.setStyleSheet("background: #1e222d; border-radius: 4px;")
+        layout = QHBoxLayout(frame)
+        name = item['name']
+        if item.get('sens'): name += f" ({item['sens']}cm)"
+        val_text = f"Sess: {item['sess_avg']:.1f} vs All: {item['all_avg']:.1f}"
+        color = "#4CAF50" if item['diff_pct'] > 0 else "#EF5350"
+        diff_text = f"{item['diff_pct']:+.1f}%"
+        layout.addWidget(QLabel(name))
+        layout.addStretch()
+        lbl_val = QLabel(val_text); lbl_val.setStyleSheet("color: #787b86;")
+        layout.addWidget(lbl_val)
+        layout.addSpacing(15)
+        lbl_diff = QLabel(diff_text); lbl_diff.setStyleSheet(f"color: {color}; font-weight: bold;")
+        layout.addWidget(lbl_diff)
+        self.scroll_layout.addWidget(frame)
+
+    def add_played_card(self, item):
+        border = "border-left: 3px solid gold;" if item['is_pb'] else ""
+        frame = QFrame()
+        frame.setStyleSheet(f"background: #1e222d; border-radius: 4px; {border}")
+        layout = QHBoxLayout(frame)
+        name = item['name']
+        if item.get('sens'): name += f" ({item['sens']}cm)"
+        if item['is_pb']: name = "🏆 " + name
+        layout.addWidget(QLabel(name))
+        layout.addStretch()
+        layout.addWidget(QLabel(f"{item['count']} runs | Best: {item['best']:.0f} | Avg: {item['avg']:.1f}"))
+        self.scroll_layout.addWidget(frame)
+--- END OF FILE: modules\session\session_report.py ---
+
+--- START OF FILE: styles.py ---
+# styles.py
+
+BG_DARK = "#131722"
+BG_PANEL = "#1e222d"
+BG_HOVER = "#2a2e39"
+ACCENT = "#2962FF"
+TEXT_MAIN = "#d1d4dc"
+TEXT_DIM = "#787b86"
+BORDER = "#363a45"
+
+QSS = f"""
+QMainWindow {{
+    background-color: {BG_DARK};
+}}
+/* --- DOCK WIDGETS --- */
+QDockWidget {{
+    titlebar-close-icon: url(close.png);
+    titlebar-normal-icon: url(float.png);
+    color: {TEXT_MAIN};
+    font-weight: bold;
+}}
+QDockWidget::title {{
+    background: {BG_PANEL};
+    padding-left: 10px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid {BORDER};
+}}
+QDockWidget::close-button, QDockWidget::float-button {{
+    background: transparent;
+    border: none;
+}}
+QDockWidget::close-button:hover, QDockWidget::float-button:hover {{
+    background: {BG_HOVER};
+}}
+
+/* --- COMMON --- */
+QWidget {{
+    color: {TEXT_MAIN};
+}}
+QFrame#Panel {{
+    background-color: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+}}
+QLineEdit {{
+    background-color: {BG_DARK};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    padding: 6px;
+    color: {TEXT_MAIN};
+}}
+QPushButton {{
+    background-color: {BG_HOVER};
+    border: 1px solid {BORDER};
+    color: {TEXT_MAIN};
+    padding: 6px 12px;
+    border-radius: 4px;
+}}
+QPushButton:hover {{
+    background-color: {ACCENT};
+    border: 1px solid {ACCENT};
+    color: white;
+}}
+QTableWidget {{
+    background-color: {BG_DARK};
+    gridline-color: {BORDER};
+    border: none;
+}}
+QHeaderView::section {{
+    background-color: {BG_PANEL};
+    color: {TEXT_DIM};
+    border: none;
+    border-bottom: 1px solid {BORDER};
+    border-right: 1px solid {BORDER};
+    padding: 4px;
+}}
+"""
+--- END OF FILE: styles.py ---
+

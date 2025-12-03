@@ -1,0 +1,2645 @@
+// PART 1 //
+
+PROJECT STRUCTURE:
+- core\__init__.py
+- core\analytics\__init__.py
+- core\analytics\parsers.py
+- core\analytics\processors.py
+- core\analytics\stats.py
+- core\config_manager.py
+- core\engine.py
+- core\locales.py
+- core\state_manager.py
+- main.py
+- modules\calendar\__init__.py
+- modules\calendar\calendar_widget.py
+- modules\calendar\daily_activity.py
+- modules\calendar\day_cell.py
+- modules\career\career_widget.py
+- modules\charts\chart_widget.py
+- modules\charts\indicators.py
+- modules\dashboard\grid_container.py
+- modules\dashboard\grid_widget.py
+- modules\dashboard\strategies.py
+- modules\dashboard\tooltip.py
+- modules\navigation\browser_tabs.py
+- modules\navigation\sidebar.py
+- modules\right_panel\analyst_tabs.py
+- modules\right_panel\ongoing.py
+- modules\session\session_list.py
+- modules\session\session_manager.py
+- modules\session\session_report.py
+- styles.py
+
+==================================================
+
+--- START OF FILE: core\__init__.py ---
+
+--- END OF FILE: core\__init__.py ---
+
+--- START OF FILE: core\analytics\__init__.py ---
+# core/analytics/__init__.py
+# Exposes the sub-modules for easier importing
+--- END OF FILE: core\analytics\__init__.py ---
+
+--- START OF FILE: core\analytics\parsers.py ---
+import os
+import re
+from datetime import datetime, timedelta
+import pandas as pd
+
+# --- GLOBAL CACHE ---
+# Stores parsed modifiers: "ScenarioName" -> {Modifiers Dict}
+# Prevents expensive regex recalculation on every tab open
+MODIFIER_CACHE = {} 
+# --------------------
+
+def parse_kovaaks_stats_file(file_path):
+    try:
+        filename = os.path.basename(file_path)
+        timestamp_match = re.search(r'(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2})', filename)
+        if timestamp_match:
+            timestamp_str = timestamp_match.group(1)
+            end_time = datetime.strptime(timestamp_str, '%Y.%m.%d-%H.%M.%S')
+        else:
+            end_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            
+        data = {'Duration': 60.0} 
+        start_time_str = None
+        
+        for line in lines:
+            if line.startswith('Scenario:'): data['Scenario'] = line.split(',', 1)[1].strip()
+            elif line.startswith('Score:'): data['Score'] = float(line.split(',')[1].strip())
+            elif line.startswith('Horiz Sens:'): data['Sens'] = float(line.split(',')[1].strip())
+            elif line.startswith('Challenge Start:'): start_time_str = line.split(',')[1].strip()
+        
+        if start_time_str:
+            try:
+                if '.' in start_time_str and len(start_time_str.split('.')[1]) > 6:
+                    start_time_str = start_time_str[:start_time_str.find('.')+7]
+                parsed_time = datetime.strptime(start_time_str, '%H:%M:%S.%f').time()
+                start_time = end_time.replace(hour=parsed_time.hour, minute=parsed_time.minute, 
+                                              second=parsed_time.second, microsecond=parsed_time.microsecond)
+                if start_time > end_time: start_time -= timedelta(days=1)
+                duration_seconds = (end_time - start_time).total_seconds()
+                if 0 < duration_seconds < 600: data['Duration'] = duration_seconds
+            except: pass
+
+        if 'Scenario' in data and 'Score' in data and 'Sens' in data:
+            data['Timestamp'] = end_time
+            return data
+        else: return None
+    except: return None
+
+def get_scenario_family_info(all_runs_df, base_scenario):
+    if all_runs_df is None or all_runs_df.empty: return None
+    family_df = all_runs_df[all_runs_df['Scenario'].str.startswith(base_scenario)].copy()
+    if family_df.empty: return None
+    
+    # Use the Global Cache
+    global MODIFIER_CACHE
+
+    def parse_modifiers(scenario_name):
+        if scenario_name in MODIFIER_CACHE:
+            return MODIFIER_CACHE[scenario_name]
+
+        modifier_str = scenario_name.replace(base_scenario, '', 1).strip()
+        if not modifier_str: return {}
+        
+        UNIT_MAP = {'s': 'Duration', 'sec': 'Duration', 'm': 'Distance', 'hp': 'Health'}
+        token_pattern = re.compile(r'(\d[\d.]*%?[a-zA-Z]*|[A-Za-z]+)')
+        tokens = token_pattern.findall(modifier_str)
+        
+        def is_value(token):
+            if re.fullmatch(r'[\d.]+%?', token): return True
+            unit_match = re.fullmatch(r'([\d.]+%?)(\w+)', token)
+            if unit_match and unit_match.groups()[1] in UNIT_MAP: return True
+            return False
+            
+        modifiers = {}
+        consumed = [False] * len(tokens); i = 0
+        while i < len(tokens) - 1:
+            if not consumed[i] and not consumed[i+1]:
+                t1, t2 = tokens[i], tokens[i+1]
+                if not is_value(t1) and is_value(t2): 
+                    modifiers[t1] = (t2, 'word_value'); consumed[i] = consumed[i+1] = True; i += 2; continue
+                elif is_value(t1) and not is_value(t2): 
+                    modifiers[t2] = (t1, 'value_word'); consumed[i] = consumed[i+1] = True; i += 2; continue
+            i += 1
+        for i, token in enumerate(tokens):
+            if not consumed[i]:
+                unit_match = re.fullmatch(r'([\d.]+%?)(\w+)', token)
+                if unit_match:
+                    value, unit = unit_match.groups()
+                    if unit in UNIT_MAP: modifiers[UNIT_MAP[unit]] = (token, 'standalone'); consumed[i] = True
+                elif '%' in token and is_value(token):
+                    modifiers['Percent'] = (token, 'standalone'); consumed[i] = True
+        
+        if not all(consumed):
+             MODIFIER_CACHE[scenario_name] = {}
+             return {}
+             
+        MODIFIER_CACHE[scenario_name] = modifiers
+        return modifiers
+        
+    family_df['Modifiers'] = family_df['Scenario'].apply(parse_modifiers)
+    return family_df
+--- END OF FILE: core\analytics\parsers.py ---
+
+--- START OF FILE: core\analytics\processors.py ---
+import os
+import pandas as pd
+from pathlib import Path
+import json
+import bisect
+from core.analytics.parsers import parse_kovaaks_stats_file
+
+APP_DATA_DIR = Path.home() / '.kovaaks_stats_viewer'
+APP_DATA_DIR.mkdir(exist_ok=True) 
+CACHE_HISTORY_PATH = APP_DATA_DIR / 'kovaaks_history_cache.pkl'
+CACHE_INFO_PATH = APP_DATA_DIR / 'kovaaks_cache_info.json'
+
+def _detect_and_assign_sessions(history_df, session_gap_minutes=30):
+    if history_df.empty or 'Timestamp' not in history_df.columns: return history_df
+    df = history_df.copy()
+    df.sort_values('Timestamp', inplace=True)
+    time_diffs = df['Timestamp'].diff()
+    session_starts = time_diffs > pd.Timedelta(minutes=session_gap_minutes)
+    session_ids = session_starts.cumsum()
+    df['SessionID'] = session_ids
+    return df
+
+def find_and_process_stats(stats_folder_path, session_gap_minutes=30):
+    path_obj = Path(stats_folder_path)
+    if not path_obj.is_dir(): return None
+    
+    processed_files_info = {}
+    cached_history_df = pd.DataFrame()
+    
+    if os.path.exists(CACHE_HISTORY_PATH) and os.path.exists(CACHE_INFO_PATH):
+        try:
+            cached_history_df = pd.read_pickle(CACHE_HISTORY_PATH)
+            with open(CACHE_INFO_PATH, 'r') as f: processed_files_info = json.load(f)
+        except: pass
+            
+    all_challenge_files = list(path_obj.glob('*- Challenge -*.csv'))
+    new_files_to_process = []
+    current_files_info = {}
+    
+    for file_path in all_challenge_files:
+        try:
+            mtime = os.path.getmtime(file_path)
+            current_files_info[str(file_path)] = mtime
+            if str(file_path) not in processed_files_info or mtime > processed_files_info[str(file_path)]:
+                new_files_to_process.append(file_path)
+        except: continue
+
+    if new_files_to_process:
+        newly_parsed_data = [d for d in (parse_kovaaks_stats_file(fp) for fp in new_files_to_process) if d]
+        if newly_parsed_data:
+            new_df = pd.DataFrame(newly_parsed_data)
+            combined_history_df = pd.concat([cached_history_df, new_df], ignore_index=True)
+            combined_history_df.drop_duplicates(subset=['Scenario', 'Sens', 'Timestamp', 'Score'], inplace=True)
+        else: combined_history_df = cached_history_df
+    else: combined_history_df = cached_history_df
+        
+    if combined_history_df.empty: return pd.DataFrame()
+    combined_history_df = _detect_and_assign_sessions(combined_history_df, session_gap_minutes)
+
+    try:
+        combined_history_df.to_pickle(CACHE_HISTORY_PATH)
+        with open(CACHE_INFO_PATH, 'w') as f: json.dump(current_files_info, f, indent=2)
+    except: pass
+    return combined_history_df.reset_index(drop=True)
+
+def enrich_history_with_stats(df):
+    """Calculates PBs and Assigns Ranks"""
+    if df is None or df.empty: return df
+    
+    df = df.sort_values('Timestamp').reset_index(drop=True)
+    
+    ranks = [("SINGULARITY", 100), ("ARCADIA", 95), ("UBER", 90), ("EXALTED", 82), ("BLESSED", 75), ("TRANSMUTE", 55)]
+    gated = {"SINGULARITY", "ARCADIA", "UBER"}
+    
+    for r, _ in ranks: df[f'Rank_{r}'] = 0
+    df['Is_PB'] = False      # Sens PB
+    df['Is_Scen_PB'] = False # Scenario PB (Any Sens)
+    df['Is_First'] = False 
+
+    updates = []
+    
+    # 1. PER SENSITIVITY PASS (Existing Logic)
+    for (scen, sens), group in df.groupby(['Scenario', 'Sens']):
+        history = []
+        indices = group.index
+        scores = group['Score'].values
+        
+        for i, score in enumerate(scores):
+            idx = indices[i]
+            run_count = i + 1
+            
+            is_pb = False
+            is_first = False
+            
+            if not history: 
+                is_first = True
+                is_pb = True 
+            elif score > history[-1]: 
+                is_pb = True
+            
+            if is_pb: updates.append((idx, 'Is_PB', True))
+            if is_first: updates.append((idx, 'Is_First', True))
+            
+            # Rank Logic (Same as before)
+            if not history: percentile = 100
+            elif score >= history[-1]: percentile = 100
+            else:
+                pos = bisect.bisect_left(history, score)
+                percentile = (pos / len(history)) * 100
+            bisect.insort(history, score)
+            
+            for r_name, r_val in ranks:
+                if r_name in gated and run_count < 10: continue
+                if percentile >= r_val: updates.append((idx, f'Rank_{r_name}', 1))
+
+    # 2. PER SCENARIO PASS (New Logic)
+    # Group only by Scenario Name to find global maxes
+    for scen, group in df.groupby('Scenario'):
+        history = []
+        indices = group.index
+        scores = group['Score'].values
+        
+        for i, score in enumerate(scores):
+            # If it's the first run ever, it's a PB, but we might filter 'Firsts' later
+            # Logic: If Score > Max(History), it's a Scen PB
+            if not history:
+                updates.append((indices[i], 'Is_Scen_PB', True))
+                history.append(score) # Optimization: Only keep max?
+                # Actually bisect is cheap. Let's keep history sorted.
+            else:
+                current_max = history[-1]
+                if score > current_max:
+                    updates.append((indices[i], 'Is_Scen_PB', True))
+                
+                bisect.insort(history, score)
+
+    # Apply
+    for col in ['Is_PB', 'Is_Scen_PB', 'Is_First'] + [f'Rank_{r[0]}' for r in ranks]:
+        df[col] = df[col].astype(int) 
+        
+    for idx, col, val in updates:
+        df.at[idx, col] = val
+        
+    return df
+--- END OF FILE: core\analytics\processors.py ---
+
+--- START OF FILE: core\analytics\stats.py ---
+import pandas as pd
+from datetime import timedelta
+from collections import defaultdict
+
+def format_timedelta(td):
+    if isinstance(td, (int, float)): td = timedelta(seconds=td)
+    total_seconds = int(td.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{hours:02}:{minutes:02}:{seconds:02}'
+
+def format_timedelta_hours(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h {minutes}m"
+
+def calculate_detailed_stats(runs_df):
+    if runs_df is None or runs_df.empty: return {}
+    df = runs_df.sort_values('Timestamp').copy()
+    scores = df['Score']
+    pb_idx = scores.idxmax()
+    
+    stats = {
+        'count': len(df), 'max': scores.max(), 'avg': scores.mean(),
+        'std': scores.std() if len(df) > 1 else 0.0,
+        'p50': scores.median(), 'p75': scores.quantile(0.75), 'min': scores.min(),
+        'pb_date': df.loc[pb_idx]['Timestamp'],
+        'pb_sens': df.loc[pb_idx]['Sens']
+    }
+    
+    recent = df.tail(min(len(df), 20))
+    if not recent.empty: stats['recent_avg'] = recent['Score'].mean()
+    
+    pre_pb = df.loc[:pb_idx].iloc[:-1].tail(20)
+    stats['launchpad_avg'] = pre_pb['Score'].mean() if not pre_pb.empty else 0.0
+    return stats
+
+def calculate_profile_stats(df):
+    if df is None or df.empty: return {}
+    stats = {
+        'total_runs': len(df),
+        'active_time': df['Duration'].sum(),
+        'unique_scens': df['Scenario'].nunique(),
+        'unique_combos': df.groupby(['Scenario', 'Sens']).ngroups,
+        'total_pbs': df['Is_PB'].sum()
+    }
+    ranks = {}
+    for col in df.columns:
+        if col.startswith('Rank_'):
+            ranks[col.replace('Rank_', '')] = df[col].sum()
+    stats['ranks'] = ranks
+    stats['top_scens'] = df['Scenario'].value_counts().head(10).to_dict()
+    return stats
+
+def analyze_session(session_df, history_df, flow_window=5):
+    if session_df.empty: return None
+    session_start = session_df['Timestamp'].min()
+    prior_history = history_df[history_df['Timestamp'] < session_start]
+
+    base_grid_avg = prior_history.groupby(['Scenario', 'Sens'])['Score'].mean().to_dict() if not prior_history.empty else {}
+    base_scen_avg = prior_history.groupby('Scenario')['Score'].mean().to_dict() if not prior_history.empty else {}
+    
+    base_grid_max = prior_history.groupby(['Scenario', 'Sens'])['Score'].max().to_dict() if not prior_history.empty else {}
+    base_scen_max = prior_history.groupby('Scenario')['Score'].max().to_dict() if not prior_history.empty else {}
+
+    def calc_graph(key_func, baselines):
+        data, hist = [], []
+        prev_pulse = 0.0
+        accs = defaultdict(lambda: {'sum':0.0, 'count':0})
+        
+        for i, row in enumerate(session_df.sort_values('Timestamp').itertuples()):
+            key = key_func(row)
+            base = baselines.get(key, 0)
+            acc = accs[key]
+            acc['sum']+=row.Score; acc['count']+=1
+            curr_avg = acc['sum']/acc['count']
+            eff_base = base if base > 0 else curr_avg
+            
+            score_pct = ((row.Score - eff_base)/eff_base)*100 if eff_base>0 else 0
+            trend_pct = ((curr_avg - eff_base)/eff_base)*100 if eff_base>0 else 0
+            hist.append(score_pct)
+            flow_pct = sum(hist[-flow_window:])/len(hist[-flow_window:])
+            pulse_pct = score_pct if i==0 else (score_pct*0.5)+(prev_pulse*0.5)
+            prev_pulse = pulse_pct
+            
+            data.append({
+                'time': int(row.Timestamp.timestamp()), 'pct': score_pct,
+                'trend_pct': trend_pct, 'flow_pct': flow_pct, 'pulse_pct': pulse_pct,
+                'scenario': row.Scenario, 'sens': row.Sens
+            })
+        return data
+
+    def calc_lists(grouper, base_max):
+        pbs, played = [], []
+        for key, g in session_df.groupby(grouper):
+            pb = g['Score'].max()
+            name = key[0] if isinstance(key, tuple) else key
+            sens = key[1] if isinstance(key, tuple) else None
+            
+            is_pb = False
+            prev = base_max.get(key)
+            if prev and pb > prev:
+                is_pb = True
+                pbs.append({'name': name, 'sens': sens, 'score': pb, 'prev': prev, 'imp': pb-prev, 'imp_pct': ((pb-prev)/prev)*100})
+            
+            played.append({'name': name, 'sens': sens, 'count': len(g), 'best': pb, 'avg': g['Score'].mean(), 'is_pb': is_pb})
+        
+        # Calculate Averages List
+        avgs_list = []
+        for key, g in session_df.groupby(grouper):
+            name = key[0] if isinstance(key, tuple) else key
+            sens = key[1] if isinstance(key, tuple) else None
+            
+            sess_avg = g['Score'].mean()
+            all_avg = base_grid_avg.get(key, sess_avg) if isinstance(key, tuple) else base_scen_avg.get(key, sess_avg)
+            
+            if all_avg > 0:
+                diff_pct = ((sess_avg - all_avg) / all_avg) * 100
+                avgs_list.append({
+                    'name': name, 'sens': sens, 
+                    'sess_avg': sess_avg, 'all_avg': all_avg, 
+                    'diff_pct': diff_pct
+                })
+
+        return pbs, avgs_list, played
+
+    g_graph = calc_graph(lambda r: (r.Scenario, r.Sens), base_grid_avg)
+    s_graph = calc_graph(lambda r: r.Scenario, base_scen_avg)
+    
+    pbs_g, avgs_g, played_g = calc_lists(['Scenario', 'Sens'], base_grid_max)
+    pbs_s, avgs_s, played_s = calc_lists('Scenario', base_scen_max)
+
+    return {
+        "meta": {
+            "date_str": session_start.strftime('%B %d, %Y'),
+            "duration_str": format_timedelta(session_df['Timestamp'].max() - session_start),
+            "active_str": format_timedelta(session_df['Duration'].sum()),
+            "play_count": len(session_df)
+        },
+        "grid": {"graph_data": g_graph, "lists": {"pbs": pbs_g, "played": played_g, "avgs": avgs_g}, "pb_count": len(pbs_g)},
+        "scenario": {"graph_data": s_graph, "lists": {"pbs": pbs_s, "played": played_s, "avgs": avgs_s}, "pb_count": len(pbs_s)}
+    }
+--- END OF FILE: core\analytics\stats.py ---
+
+--- START OF FILE: core\config_manager.py ---
+import json
+from pathlib import Path
+
+# --- THE TRUTH SOURCE ---
+# Update this dictionary when you add new features.
+# The app will automatically merge these defaults into user configs.
+DEFAULT_SETTINGS = {
+    "config_version": 2,
+    "global": {
+        "stats_path": "",
+        "session_gap": 30,
+        "theme": "dark",
+        "app_layout": {},
+        "open_tabs": []
+    },
+    "scenarios": {},  # Will hold per-scenario view settings
+    "favorites": []
+}
+
+class ConfigManager:
+    def __init__(self):
+        self.config_path = Path.home() / '.kovaaks_stats_viewer' / "v2_config.json"
+        self.settings = self._load_settings()
+
+    def _load_settings(self):
+        """Loads settings and performs a deep merge with defaults."""
+        user_data = {}
+        if self.config_path.exists():
+            try:
+                with open(self.config_path, 'r') as f:
+                    user_data = json.load(f)
+            except:
+                print("Config file corrupted, starting fresh.")
+        
+        # Merge User Data INTO Defaults
+        # This ensures new keys in DEFAULT_SETTINGS always exist
+        merged = self._deep_merge(DEFAULT_SETTINGS.copy(), user_data)
+        
+        # (Optional) Basic Migration Logic could go here if structures change drastically
+        # e.g. if merged['config_version'] < 2: self._migrate_v1_to_v2(merged)
+
+        return merged
+
+    def _deep_merge(self, default, user):
+        """
+        Recursively merges user settings into default settings.
+        1. If key exists in both and is dict, recurse.
+        2. If key exists in user, use user value.
+        3. If key missing in user, keep default.
+        """
+        for key, value in user.items():
+            if key in default and isinstance(default[key], dict) and isinstance(value, dict):
+                self._deep_merge(default[key], value)
+            else:
+                default[key] = value
+        return default
+
+    def save_settings(self):
+        with open(self.config_path, 'w') as f:
+            json.dump(self.settings, f, indent=2)
+
+    def get(self, key, scenario=None, default=None):
+        if scenario and scenario in self.settings["scenarios"]:
+            if key in self.settings["scenarios"][scenario]:
+                return self.settings["scenarios"][scenario][key]
+        if key in self.settings["global"]:
+            return self.settings["global"][key]
+        return default
+
+    def set_global(self, key, value):
+        self.settings["global"][key] = value
+        self.save_settings()
+
+    def set_scenario(self, scenario, key, value):
+        if scenario not in self.settings["scenarios"]:
+            self.settings["scenarios"][scenario] = {}
+        self.settings["scenarios"][scenario][key] = value
+        self.save_settings()
+
+    # --- FAVORITES ---
+    def get_favorites(self):
+        return self.settings.get("favorites", [])
+
+    def add_favorite(self, scenario_name):
+        favs = self.get_favorites()
+        if scenario_name not in favs:
+            favs.append(scenario_name)
+            self.settings["favorites"] = favs
+            self.save_settings()
+
+    def remove_favorite(self, scenario_name):
+        favs = self.get_favorites()
+        if scenario_name in favs:
+            favs.remove(scenario_name)
+            self.settings["favorites"] = favs
+            self.save_settings()
+            
+    def is_favorite(self, scenario_name):
+        return scenario_name in self.get_favorites()
+--- END OF FILE: core\config_manager.py ---
+
+--- START OF FILE: core\engine.py ---
+import os
+import pandas as pd
+from pathlib import Path
+import re
+import json
+from datetime import datetime, timedelta
+from collections import defaultdict
+import bisect
+
+APP_DATA_DIR = Path.home() / '.kovaaks_stats_viewer'
+APP_DATA_DIR.mkdir(exist_ok=True) 
+
+CACHE_HISTORY_PATH = APP_DATA_DIR / 'kovaaks_history_cache.pkl'
+CACHE_INFO_PATH = APP_DATA_DIR / 'kovaaks_cache_info.json'
+
+# --- 1. CORE PARSING ---
+def parse_kovaaks_stats_file(file_path):
+    try:
+        filename = os.path.basename(file_path)
+        timestamp_match = re.search(r'(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2})', filename)
+        if timestamp_match:
+            timestamp_str = timestamp_match.group(1)
+            end_time = datetime.strptime(timestamp_str, '%Y.%m.%d-%H.%M.%S')
+        else:
+            end_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            
+        data = {'Duration': 60.0} 
+        start_time_str = None
+        
+        for line in lines:
+            if line.startswith('Scenario:'): data['Scenario'] = line.split(',', 1)[1].strip()
+            elif line.startswith('Score:'): data['Score'] = float(line.split(',')[1].strip())
+            elif line.startswith('Horiz Sens:'): data['Sens'] = float(line.split(',')[1].strip())
+            elif line.startswith('Challenge Start:'): start_time_str = line.split(',')[1].strip()
+        
+        if start_time_str:
+            try:
+                if '.' in start_time_str and len(start_time_str.split('.')[1]) > 6:
+                    start_time_str = start_time_str[:start_time_str.find('.')+7]
+                parsed_time = datetime.strptime(start_time_str, '%H:%M:%S.%f').time()
+                start_time = end_time.replace(hour=parsed_time.hour, minute=parsed_time.minute, 
+                                              second=parsed_time.second, microsecond=parsed_time.microsecond)
+                if start_time > end_time: start_time -= timedelta(days=1)
+                duration_seconds = (end_time - start_time).total_seconds()
+                if 0 < duration_seconds < 600: data['Duration'] = duration_seconds
+            except: pass
+
+        if 'Scenario' in data and 'Score' in data and 'Sens' in data:
+            data['Timestamp'] = end_time
+            return data
+        else: return None
+    except: return None
+
+def _detect_and_assign_sessions(history_df, session_gap_minutes=30):
+    if history_df.empty or 'Timestamp' not in history_df.columns: return history_df
+    df = history_df.copy()
+    df.sort_values('Timestamp', inplace=True)
+    time_diffs = df['Timestamp'].diff()
+    session_starts = time_diffs > pd.Timedelta(minutes=session_gap_minutes)
+    session_ids = session_starts.cumsum()
+    df['SessionID'] = session_ids
+    return df
+
+def find_and_process_stats(stats_folder_path, session_gap_minutes=30):
+    path_obj = Path(stats_folder_path)
+    if not path_obj.is_dir(): return None
+    
+    processed_files_info = {}
+    cached_history_df = pd.DataFrame()
+    
+    if os.path.exists(CACHE_HISTORY_PATH) and os.path.exists(CACHE_INFO_PATH):
+        try:
+            cached_history_df = pd.read_pickle(CACHE_HISTORY_PATH)
+            with open(CACHE_INFO_PATH, 'r') as f: processed_files_info = json.load(f)
+        except: pass
+            
+    all_challenge_files = list(path_obj.glob('*- Challenge -*.csv'))
+    new_files_to_process = []
+    current_files_info = {}
+    
+    for file_path in all_challenge_files:
+        try:
+            mtime = os.path.getmtime(file_path)
+            current_files_info[str(file_path)] = mtime
+            if str(file_path) not in processed_files_info or mtime > processed_files_info[str(file_path)]:
+                new_files_to_process.append(file_path)
+        except: continue
+
+    if new_files_to_process:
+        newly_parsed_data = [d for d in (parse_kovaaks_stats_file(fp) for fp in new_files_to_process) if d]
+        if newly_parsed_data:
+            new_df = pd.DataFrame(newly_parsed_data)
+            combined_history_df = pd.concat([cached_history_df, new_df], ignore_index=True)
+            combined_history_df.drop_duplicates(subset=['Scenario', 'Sens', 'Timestamp', 'Score'], inplace=True)
+        else: combined_history_df = cached_history_df
+    else: combined_history_df = cached_history_df
+        
+    if combined_history_df.empty: return pd.DataFrame()
+    combined_history_df = _detect_and_assign_sessions(combined_history_df, session_gap_minutes)
+
+    try:
+        combined_history_df.to_pickle(CACHE_HISTORY_PATH)
+        with open(CACHE_INFO_PATH, 'w') as f: json.dump(current_files_info, f, indent=2)
+    except: pass
+    return combined_history_df.reset_index(drop=True)
+
+def get_scenario_family_info(all_runs_df, base_scenario):
+    if all_runs_df is None or all_runs_df.empty: return None
+    family_df = all_runs_df[all_runs_df['Scenario'].str.startswith(base_scenario)].copy()
+    if family_df.empty: return None
+    
+    memo = {}
+
+    def parse_modifiers(scenario_name):
+        if scenario_name in memo:
+            return memo[scenario_name]
+
+        modifier_str = scenario_name.replace(base_scenario, '', 1).strip()
+        if not modifier_str: return {}
+        
+        UNIT_MAP = {'s': 'Duration', 'sec': 'Duration', 'm': 'Distance', 'hp': 'Health'}
+        token_pattern = re.compile(r'(\d[\d.]*%?[a-zA-Z]*|[A-Za-z]+)')
+        tokens = token_pattern.findall(modifier_str)
+        
+        def is_value(token):
+            if re.fullmatch(r'[\d.]+%?', token): return True
+            unit_match = re.fullmatch(r'([\d.]+%?)(\w+)', token)
+            if unit_match and unit_match.groups()[1] in UNIT_MAP: return True
+            return False
+            
+        modifiers = {}
+        consumed = [False] * len(tokens); i = 0
+        while i < len(tokens) - 1:
+            if not consumed[i] and not consumed[i+1]:
+                t1, t2 = tokens[i], tokens[i+1]
+                if not is_value(t1) and is_value(t2): 
+                    modifiers[t1] = (t2, 'word_value'); consumed[i] = consumed[i+1] = True; i += 2; continue
+                elif is_value(t1) and not is_value(t2): 
+                    modifiers[t2] = (t1, 'value_word'); consumed[i] = consumed[i+1] = True; i += 2; continue
+            i += 1
+        for i, token in enumerate(tokens):
+            if not consumed[i]:
+                unit_match = re.fullmatch(r'([\d.]+%?)(\w+)', token)
+                if unit_match:
+                    value, unit = unit_match.groups()
+                    if unit in UNIT_MAP: modifiers[UNIT_MAP[unit]] = (token, 'standalone'); consumed[i] = True
+                elif '%' in token and is_value(token):
+                    modifiers['Percent'] = (token, 'standalone'); consumed[i] = True
+        
+        # CRITICAL V1 LOGIC: Filter out "Dirty" matches
+        if not all(consumed):
+             memo[scenario_name] = {}
+             return {}
+             
+        memo[scenario_name] = modifiers
+        return modifiers
+        
+    family_df['Modifiers'] = family_df['Scenario'].apply(parse_modifiers)
+    return family_df
+
+# --- 2. ENRICHMENT (RANKS) ---
+
+def enrich_history_with_stats(df):
+    """Calculates PBs and Assigns Ranks"""
+    if df is None or df.empty: return df
+    df = df.sort_values('Timestamp').copy()
+    
+    # Rank Definitions
+    ranks = [("SINGULARITY", 100), ("ARCADIA", 95), ("UBER", 90), ("EXALTED", 82), ("BLESSED", 75), ("TRANSMUTE", 55)]
+    gated = {"SINGULARITY", "ARCADIA", "UBER"}
+    
+    # Initialize Rank Columns
+    for r, _ in ranks: df[f'Rank_{r}'] = 0
+    df['Is_PB'] = False
+
+    # Process by Combo
+    updates = []
+    
+    for (scen, sens), group in df.groupby(['Scenario', 'Sens']):
+        history = []
+        indices = group.index
+        scores = group['Score'].values
+        
+        for i, score in enumerate(scores):
+            idx = indices[i]
+            run_count = i + 1
+            
+            # PB Logic
+            is_pb = False
+            if not history: is_pb = False # First run isn't an "Improvement"
+            elif score > history[-1]: is_pb = True
+            
+            if is_pb: updates.append((idx, 'Is_PB', True))
+            
+            # Rank Logic
+            if not history: # First run is peak
+                percentile = 100
+            elif score >= history[-1]: 
+                percentile = 100
+            else:
+                pos = bisect.bisect_left(history, score)
+                percentile = (pos / len(history)) * 100
+            
+            bisect.insort(history, score)
+            
+            for r_name, r_val in ranks:
+                if r_name in gated and run_count < 10: continue
+                if percentile >= r_val:
+                    updates.append((idx, f'Rank_{r_name}', 1))
+
+    # Apply updates efficiently
+    # We reconstruct small DFs to update main DF
+    for col in ['Is_PB'] + [f'Rank_{r[0]}' for r in ranks]:
+        df[col] = df[col].astype(int) # Ensure int for ranks
+        
+    for idx, col, val in updates:
+        df.at[idx, col] = val
+        
+    return df
+
+# --- 3. ANALYSIS ---
+
+def format_timedelta(td):
+    if isinstance(td, (int, float)): td = timedelta(seconds=td)
+    total_seconds = int(td.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{hours:02}:{minutes:02}:{seconds:02}'
+
+def format_timedelta_hours(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h {minutes}m"
+
+def calculate_detailed_stats(runs_df):
+    if runs_df is None or runs_df.empty: return {}
+    df = runs_df.sort_values('Timestamp').copy()
+    scores = df['Score']
+    pb_idx = scores.idxmax()
+    
+    stats = {
+        'count': len(df), 'max': scores.max(), 'avg': scores.mean(),
+        'std': scores.std() if len(df) > 1 else 0.0,
+        'p50': scores.median(), 'p75': scores.quantile(0.75), 'min': scores.min(),
+        'pb_date': df.loc[pb_idx]['Timestamp'],
+        'pb_sens': df.loc[pb_idx]['Sens']
+    }
+    
+    recent = df.tail(min(len(df), 20))
+    if not recent.empty: stats['recent_avg'] = recent['Score'].mean()
+    
+    pre_pb = df.loc[:pb_idx].iloc[:-1].tail(20)
+    stats['launchpad_avg'] = pre_pb['Score'].mean() if not pre_pb.empty else 0.0
+    return stats
+
+def calculate_profile_stats(df):
+    """Aggregates stats for Career Profile"""
+    if df is None or df.empty: return {}
+    
+    stats = {
+        'total_runs': len(df),
+        'active_time': df['Duration'].sum(),
+        'unique_scens': df['Scenario'].nunique(),
+        'unique_combos': df.groupby(['Scenario', 'Sens']).ngroups,
+        'total_pbs': df['Is_PB'].sum()
+    }
+    
+    # Ranks
+    ranks = {}
+    for col in df.columns:
+        if col.startswith('Rank_'):
+            ranks[col.replace('Rank_', '')] = df[col].sum()
+    stats['ranks'] = ranks
+    
+    # Top Scenarios
+    stats['top_scens'] = df['Scenario'].value_counts().head(10).to_dict()
+    
+    return stats
+
+def analyze_session(session_df, history_df, flow_window=5):
+    if session_df.empty: return None
+    session_start = session_df['Timestamp'].min()
+    prior_history = history_df[history_df['Timestamp'] < session_start]
+
+    base_grid_avg = prior_history.groupby(['Scenario', 'Sens'])['Score'].mean().to_dict() if not prior_history.empty else {}
+    base_scen_avg = prior_history.groupby('Scenario')['Score'].mean().to_dict() if not prior_history.empty else {}
+    
+    base_grid_max = prior_history.groupby(['Scenario', 'Sens'])['Score'].max().to_dict() if not prior_history.empty else {}
+    base_scen_max = prior_history.groupby('Scenario')['Score'].max().to_dict() if not prior_history.empty else {}
+
+    def calc_graph(key_func, baselines):
+        data, hist = [], []
+        prev_pulse = 0.0
+        accs = defaultdict(lambda: {'sum':0.0, 'count':0})
+        
+        for i, row in enumerate(session_df.sort_values('Timestamp').itertuples()):
+            key = key_func(row)
+            base = baselines.get(key, 0)
+            acc = accs[key]
+            acc['sum']+=row.Score; acc['count']+=1
+            curr_avg = acc['sum']/acc['count']
+            eff_base = base if base > 0 else curr_avg
+            
+            score_pct = ((row.Score - eff_base)/eff_base)*100 if eff_base>0 else 0
+            trend_pct = ((curr_avg - eff_base)/eff_base)*100 if eff_base>0 else 0
+            hist.append(score_pct)
+            flow_pct = sum(hist[-flow_window:])/len(hist[-flow_window:])
+            pulse_pct = score_pct if i==0 else (score_pct*0.5)+(prev_pulse*0.5)
+            prev_pulse = pulse_pct
+            
+            data.append({
+                'time': int(row.Timestamp.timestamp()), 'pct': score_pct,
+                'trend_pct': trend_pct, 'flow_pct': flow_pct, 'pulse_pct': pulse_pct,
+                'scenario': row.Scenario, 'sens': row.Sens
+            })
+        return data
+
+    def calc_lists(grouper, base_max):
+        pbs, played = [], []
+        for key, g in session_df.groupby(grouper):
+            pb = g['Score'].max()
+            name = key[0] if isinstance(key, tuple) else key
+            sens = key[1] if isinstance(key, tuple) else None
+            
+            is_pb = False
+            prev = base_max.get(key)
+            if prev and pb > prev:
+                is_pb = True
+                pbs.append({'name': name, 'sens': sens, 'score': pb, 'prev': prev, 'imp': pb-prev, 'imp_pct': ((pb-prev)/prev)*100})
+            
+            played.append({'name': name, 'sens': sens, 'count': len(g), 'best': pb, 'avg': g['Score'].mean(), 'is_pb': is_pb})
+        return pbs, [], played # skipping avgs list for brevity as logic is similar
+
+    g_graph = calc_graph(lambda r: (r.Scenario, r.Sens), base_grid_avg)
+    s_graph = calc_graph(lambda r: r.Scenario, base_scen_avg)
+    
+    pbs_g, _, played_g = calc_lists(['Scenario', 'Sens'], base_grid_max)
+    pbs_s, _, played_s = calc_lists('Scenario', base_scen_max)
+
+    return {
+        "meta": {
+            "date_str": session_start.strftime('%B %d, %Y'),
+            "duration_str": format_timedelta(session_df['Timestamp'].max() - session_start),
+            "active_str": format_timedelta(session_df['Duration'].sum()),
+            "play_count": len(session_df)
+        },
+        "grid": {"graph_data": g_graph, "lists": {"pbs": pbs_g, "played": played_g, "avgs": []}, "pb_count": len(pbs_g)},
+        "scenario": {"graph_data": s_graph, "lists": {"pbs": pbs_s, "played": played_s, "avgs": []}, "pb_count": len(pbs_s)}
+    }
+--- END OF FILE: core\engine.py ---
+
+--- START OF FILE: core\locales.py ---
+# locales.py
+
+# --- CENTRAL VERSION CONTROL ---
+APP_VERSION = "v2.1"
+# -------------------------------
+
+# Dictionary of all text used in the app
+TRANSLATIONS = {
+    "en": {
+        # Main UI
+        "window_title": "Variant Stats Viewer by iyo & Gemini ({ver})", # Use {ver} placeholder
+        "search_label": "Search for Base Scenario:",
+        "ready_label": "Ready. Select stats folder and click 'Load Stats'.",
+        "loading_label": "Loading stats, please wait...",
+        "loaded_label": "Loaded {count} total runs. Ready to search.",
+        "load_err_label": "Load failed or no data found.",
+        "load_btn": "Load Stats",
+        "refresh_btn": "Refresh Stats (F5)",
+        "session_report_btn": "Last Session Report",
+        "session_hist_btn": "Session History",
+        "select_folder_btn": "Select Stats Folder",
+        "hint_hide": "(Right-click Scenario/CM to hide)",
+        
+        # Lists
+        "recently_played": "Recently Played",
+        "favorites": "Favorites",
+        "recents": "Recents",
+        "compare_by": "Compare by:",
+        "filter_format": "Filter Format:",
+        
+        # Settings Row
+        "session_gap": "Session Gap (min):",
+        "req_refresh": "(Requires Refresh)",
+        "theme": "Theme:",
+        "show_decimals": "Show Decimals",
+        "manage_hidden": "Manage Hidden",
+        "font_size": "Font Size:",
+        "cell_h": "Cell H:",
+        
+        # Analysis Modes
+        "sens_filter": "Sens Filter:",
+        "grid_mode": "Grid Mode:",
+        "highlight": "Highlight:",
+        "pb_num": "PB #:",
+        "target": "Target:",
+        
+        # Dropdown Options & Radio Buttons
+        "opt_all": "All",
+        "opt_5cm": "5cm Inc.",
+        "opt_10cm": "10cm Inc.",
+        "opt_custom_step": "Custom Step",
+        "opt_specific": "Specific List",
+        
+        "mode_pb": "Personal Best",
+        "mode_avg": "Average Score",
+        "mode_count": "Play Count",
+        "mode_percentile": "Nth Percentile",
+        
+        "hl_none": "None",
+        "hl_drop": "Performance Drop",
+        "hl_row_heat": "Row Heatmap",
+        "hl_global_heat": "Global Heatmap",
+        "hl_target": "Target Score",
+        "hl_recent_success": "Recent Success (Days)",
+        
+        # Grid Headers / Tooltips
+        "rating": "Global Average: {val}",
+        "avg_row": "-- Averages --",
+        "col_avg": "AVG",
+        "col_best": "Best",
+        "col_cm": "cm",
+        "tooltip_sens": "Sensitivity: {val}",
+        "tooltip_pb": "PB: {val} (on {date})",
+        "tooltip_runs": "Runs: {val}",
+        "tooltip_avg": "Avg: {val}",
+        "tooltip_med": "Median: {val} | 75th: {val2}",
+        "tooltip_launchpad": "Avg before prev PB: {val}",
+        "tooltip_recent": "Recent Avg:    {val}",
+        
+        # Session Report
+        "rep_title": "Session Report - {date}",
+        "rep_duration": "Total Duration",
+        "rep_active": "Active Playtime",
+        "rep_density": "Play Density",
+        "rep_plays": "Total Plays",
+        "rep_pbs": "Total PBs",
+        "rep_browse": "Browse History...",
+        "rep_refresh": "Refresh (F5)",
+        "rep_summarize": "Summarize by Scenario",
+        "rep_sort": "Sort by:",
+        "rep_graph_title": "Session Performance Flow",
+        
+        "sec_played": "Scenarios Played ({count})",
+        "sec_pbs": "Personal Bests ({count})",
+        "sec_avgs": "Average Score Comparison ({count})",
+        "sec_ranks": "Rank Achieved",
+        
+        "sort_perf": "Performance",
+        "sort_count": "Play Count",
+        "sort_order": "Order Played",
+        "sort_alpha": "Alphabetical",
+        
+        "lbl_session": "Session: {val} ({count} runs)",
+        "lbl_alltime": "All-Time: {val} ({count} runs)",
+        "lbl_new_pb": "New PB: {new} (vs. {old})",
+        
+        # Graph Window
+        "graph_view_mode": "View Mode:",
+        "graph_raw": "Raw Data",
+        "graph_daily": "Daily Avg",
+        "graph_weekly": "Weekly Avg",
+        "graph_monthly": "Monthly Avg",
+        "graph_session": "Session Avg",
+        "graph_grouped": "Grouped Avg", # NEW
+        "graph_hide_count": "Hide Count <=",
+        
+        "graph_hide_low": "Hide scores below:",
+        "graph_connect": "Connect Sessions",
+        "graph_4color": "4-Color Cycle",
+        "graph_color_sens": "Color by Sens", # NEW
+        "graph_group_size": "Group Size (N=)", # NEW
+        
+        # Misc
+        "restart_msg": "Please restart the application to apply language changes.",
+        "restart_title": "Restart Required",
+        "lang_label": "Language:",
+    },
+    
+    "jp": {
+        "window_title": "Variant Stats Viewer by iyo & Gemini ({ver})",
+        "search_label": "シナリオ検索:",
+        "ready_label": "準備完了。フォルダを選択して読み込んでください。",
+        "loading_label": "読み込み中...",
+        "loaded_label": "計{count}件のスコアを読み込みました。",
+        "load_err_label": "読み込み失敗、またはデータがありません。",
+        "load_btn": "スコア読み込み",
+        "refresh_btn": "更新 (F5)",
+        "session_report_btn": "前回のセッションレポート",
+        "session_hist_btn": "セッション履歴",
+        "select_folder_btn": "フォルダ選択",
+        "hint_hide": "(シナリオ/cmを右クリックで非表示)",
+        
+        "recently_played": "最近プレイしたシナリオ",
+        "favorites": "お気に入り",
+        "recents": "履歴",
+        "compare_by": "比較軸:",
+        "filter_format": "フィルタ形式:",
+        
+        "session_gap": "セッション間隔(分):",
+        "req_refresh": "(要再読込)",
+        "theme": "テーマ:",
+        "show_decimals": "小数表示",
+        "manage_hidden": "非表示管理",
+        "font_size": "文字サイズ:",
+        "cell_h": "セル高さ:",
+        
+        "sens_filter": "感度フィルタ:",
+        "grid_mode": "表示モード:",
+        "highlight": "ハイライト:",
+        "pb_num": "順位:",
+        "target": "目標:",
+        
+        "opt_all": "全て",
+        "opt_5cm": "5cm刻み",
+        "opt_10cm": "10cm刻み",
+        "opt_custom_step": "カスタム刻み",
+        "opt_specific": "指定リスト",
+        
+        "mode_pb": "自己ベスト",
+        "mode_avg": "平均スコア",
+        "mode_count": "プレイ回数",
+        "mode_percentile": "上位 N%",
+        
+        "hl_none": "なし",
+        "hl_drop": "スコア低下",
+        "hl_row_heat": "行ヒートマップ",
+        "hl_global_heat": "全体ヒートマップ",
+        "hl_target": "目標スコア",
+        "hl_recent_success": "最近の達成 (日数)",
+        
+        "rating": "全体平均: {val}",
+        "avg_row": "-- 平均 --",
+        "col_avg": "平均",
+        "col_best": "ベスト",
+        "col_cm": "cm",
+        "tooltip_sens": "感度: {val}",
+        "tooltip_pb": "PB: {val} ({date})",
+        "tooltip_runs": "回数: {val}",
+        "tooltip_avg": "平均: {val}",
+        "tooltip_med": "中央値: {val} | 75%: {val2}",
+        "tooltip_launchpad": "PB更新直前の平均: {val}",
+        "tooltip_recent": "直近平均:    {val}",
+        
+        "rep_title": "セッションレポート - {date}",
+        "rep_duration": "総時間",
+        "rep_active": "プレイ時間",
+        "rep_density": "プレイ密度",
+        "rep_plays": "プレイ回数",
+        "rep_pbs": "更新数",
+        "rep_browse": "履歴を見る...",
+        "rep_refresh": "更新 (F5)",
+        "rep_summarize": "シナリオ別に集計",
+        "rep_sort": "並び替え:",
+        "rep_graph_title": "セッションパフォーマンス推移",
+        
+        "sec_played": "プレイしたシナリオ ({count})",
+        "sec_pbs": "自己ベスト更新 ({count})",
+        "sec_avgs": "平均スコア比較 ({count})",
+        "sec_ranks": "ランク獲得数",
+        
+        "sort_perf": "パフォーマンス",
+        "sort_count": "回数",
+        "sort_order": "プレイ順",
+        "sort_alpha": "名前順",
+        
+        "lbl_session": "今回: {val} ({count}回)",
+        "lbl_alltime": "通算: {val} ({count}回)",
+        "lbl_new_pb": "新記録: {new} (旧: {old})",
+        
+        "graph_view_mode": "表示モード:",
+        "graph_raw": "生データ",
+        "graph_daily": "日別平均",
+        "graph_weekly": "週別平均",
+        "graph_monthly": "月別平均",
+        "graph_session": "セッション平均",
+        "graph_grouped": "グループ平均", # NEW
+        
+        "graph_hide_low": "以下のスコアを非表示:",
+        "graph_connect": "セッションを繋ぐ",
+        "graph_4color": "4色サイクル",
+        "graph_color_sens": "感度別カラー", # NEW
+        "graph_group_size": "グループサイズ (N=)", # NEW
+        
+        "restart_msg": "言語変更を適用するには再起動してください。",
+        "restart_title": "再起動が必要です",
+        "lang_label": "言語:",
+    },
+    #just these two languages for now
+}
+
+def get_text(lang_code, key, **kwargs):
+    """
+    Retrieves text for the given language code and key.
+    Falls back to 'en' if language or key is missing.
+    Accepts kwargs for string formatting (e.g., {val}).
+    Injects {ver} automatically if not provided.
+    """
+    # Auto-inject version if not provided
+    kwargs.setdefault('ver', APP_VERSION)
+
+    lang_dict = TRANSLATIONS.get(lang_code, TRANSLATIONS["en"])
+    text = lang_dict.get(key, TRANSLATIONS["en"].get(key, f"MISSING: {key}"))
+    
+    if kwargs:
+        try:
+            return text.format(**kwargs)
+        except KeyError:
+            return text
+    return text
+--- END OF FILE: core\locales.py ---
+
+--- START OF FILE: core\state_manager.py ---
+from PyQt6.QtCore import QObject, pyqtSignal
+
+class StateManager(QObject):
+    """
+    Central Hub for application state.
+    """
+    data_updated = pyqtSignal(object) 
+    scenario_selected = pyqtSignal(str) 
+    variant_selected = pyqtSignal(dict) 
+    settings_changed = pyqtSignal() 
+    session_selected = pyqtSignal(int)
+    
+    # NEW: Updates the main window header
+    chart_title_changed = pyqtSignal(str) 
+
+    def __init__(self):
+        super().__init__()
+--- END OF FILE: core\state_manager.py ---
+
+--- START OF FILE: main.py ---
+import sys
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QDockWidget, QLabel, QSplitter, 
+                             QMenu, QPushButton, QHBoxLayout, QVBoxLayout, QWidget, 
+                             QFileDialog, QDialog, QFormLayout, QSpinBox, QMessageBox,
+                             QComboBox)
+from PyQt6.QtGui import QAction, QKeySequence, QShortcut
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QByteArray
+from pathlib import Path
+
+import styles
+from core.state_manager import StateManager
+from core.config_manager import ConfigManager
+from core.analytics import processors as engine # Updated Import
+
+# Modules
+from modules.navigation.browser_tabs import BrowserTabs
+from modules.dashboard.grid_container import GridContainer
+from modules.charts.chart_widget import ChartWidget
+from modules.right_panel.analyst_tabs import AnalystTabs
+
+# --- SETTINGS DIALOG ---
+class SettingsDialog(QDialog):
+    def __init__(self, config_manager, parent=None):
+        super().__init__(parent)
+        self.config_manager = config_manager
+        self.setWindowTitle("Preferences")
+        self.resize(300, 200) # Taller
+        self.setStyleSheet(styles.QSS)
+        
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        
+        # Session Gap
+        self.sb_gap = QSpinBox()
+        self.sb_gap.setRange(1, 1440)
+        self.sb_gap.setValue(self.config_manager.get("session_gap", default=30))
+        self.sb_gap.setSuffix(" min")
+        form.addRow("Session Gap:", self.sb_gap)
+        
+        # Startup Tab
+        self.cb_startup = QComboBox()
+        self.cb_startup.addItems(["Last", "Calendar", "Ongoing", "Session Report", "Career Profile"])
+        current = self.config_manager.get("startup_tab_mode", default="Last")
+        self.cb_startup.setCurrentText(current)
+        form.addRow("Startup Tab:", self.cb_startup)
+        
+        layout.addLayout(form)
+        
+        lbl_info = QLabel("Note: Changing Session Gap will reload all stats.")
+        lbl_info.setStyleSheet("color: #787b86; font-size: 11px; font-style: italic;")
+        lbl_info.setWordWrap(True)
+        layout.addWidget(lbl_info)
+        layout.addStretch()
+        
+        btn_box = QHBoxLayout()
+        btn_save = QPushButton("Save & Reload"); btn_save.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Cancel"); btn_cancel.clicked.connect(self.reject)
+        btn_box.addStretch(); btn_box.addWidget(btn_cancel); btn_box.addWidget(btn_save)
+        layout.addLayout(btn_box)
+
+    def get_values(self):
+        return {
+            "session_gap": self.sb_gap.value(),
+            "startup_tab_mode": self.cb_startup.currentText()
+        }
+
+# --- DATA LOADER THREAD ---
+class DataLoader(QThread):
+    finished = pyqtSignal(object)
+    
+    def __init__(self, path, session_gap): 
+        super().__init__()
+        self.path = path
+        self.session_gap = session_gap
+
+    def run(self):
+        # Pass the gap to the processor
+        df = engine.find_and_process_stats(self.path, session_gap_minutes=self.session_gap)
+        if df is not None and not df.empty: 
+            df = engine.enrich_history_with_stats(df)
+        self.finished.emit(df)
+
+class KovaaksV2App(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("VSV 2.0")
+        self.resize(1800, 1000)
+        self.setStyleSheet(styles.QSS)
+        
+        self.state_manager = StateManager()
+        self.config_manager = ConfigManager()
+        self.current_stats_path = None
+        self.is_initial_load = True
+        
+        # Listen for chart titles to update header
+        self.state_manager.chart_title_changed.connect(self.update_header_title)
+
+        self.setDockOptions(QMainWindow.DockOption.AllowNestedDocks | 
+                            QMainWindow.DockOption.AnimatedDocks | 
+                            QMainWindow.DockOption.AllowTabbedDocks)
+
+        self.setup_layout() 
+        self.setup_menu()   
+        self.load_app_state() 
+        
+        self.shortcut_refresh = QShortcut(QKeySequence("F5"), self)
+        self.shortcut_refresh.activated.connect(self.refresh_stats)
+        
+        self.auto_load()
+
+    def setup_layout(self):
+        self.central_container = QWidget()
+        self.central_layout = QVBoxLayout(self.central_container)
+        self.central_layout.setContentsMargins(0, 0, 0, 0)
+        self.central_layout.setSpacing(0)
+        self.setCentralWidget(self.central_container)
+
+        # 1. HEADER
+        self.header_widget = QWidget()
+        self.header_widget.setFixedHeight(50)
+        self.header_widget.setStyleSheet("background-color: #131722; border-bottom: 1px solid #363a45;")
+        header_layout = QHBoxLayout(self.header_widget)
+        header_layout.setContentsMargins(20, 0, 20, 0)
+        
+        # Dynamic Title Label
+        self.header_label = QLabel("ANALYTICS")
+        self.header_label.setStyleSheet("font-weight: bold; font-size: 16px; color: #d1d4dc; margin-right: 20px;")
+        header_layout.addWidget(self.header_label)
+        
+        header_layout.addStretch()
+        
+        btn_load = QPushButton("Load Folder")
+        btn_load.clicked.connect(self.select_folder)
+        btn_load.setStyleSheet("""
+            QPushButton { background-color: #2a2e39; border: 1px solid #363a45; color: #d1d4dc; padding: 6px 12px; }
+            QPushButton:hover { background-color: #363a45; }
+        """)
+        header_layout.addWidget(btn_load)
+        
+        self.btn_refresh = QPushButton("Refresh (F5)")
+        self.btn_refresh.clicked.connect(self.refresh_stats)
+        self.btn_refresh.setStyleSheet("""
+            QPushButton { background-color: #2962FF; border: none; color: white; padding: 6px 12px; font-weight: bold;}
+            QPushButton:hover { background-color: #1e53e5; }
+            QPushButton:disabled { background-color: #363a45; color: #787b86; }
+        """)
+        header_layout.addWidget(self.btn_refresh)
+        
+        self.central_layout.addWidget(self.header_widget)
+
+        # 2. SPLITTER
+        self.center_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.center_splitter.setObjectName("CenterSplitter")
+        
+        self.chart_widget = ChartWidget(self.state_manager)
+        self.chart_widget.setMinimumHeight(200)
+        
+        self.grid_container = GridContainer(self.state_manager, self.config_manager)
+        self.grid_container.setMinimumHeight(200)
+        
+        self.center_splitter.addWidget(self.chart_widget)
+        self.center_splitter.addWidget(self.grid_container)
+        
+        self.central_layout.addWidget(self.center_splitter)
+
+        # 3. DOCKS
+        self.dock_nav = QDockWidget("Browser", self)
+        self.dock_nav.setObjectName("DockNav")
+        self.dock_nav.setMinimumWidth(50) 
+        self.dock_nav.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea)
+        self.dock_nav.setWidget(BrowserTabs(self.state_manager, self.config_manager))
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.dock_nav)
+
+        self.dock_analyst = QDockWidget("Analyst", self)
+        self.dock_analyst.setObjectName("DockAnalyst")
+        self.dock_analyst.setMinimumWidth(50)
+        self.dock_analyst.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea)
+
+        self.dock_analyst.setWidget(AnalystTabs(self.state_manager, self.config_manager))
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock_analyst)
+
+    def setup_menu(self):
+        menu_bar = self.menuBar()
+        
+        # Settings Menu
+        settings_menu = menu_bar.addMenu("Settings")
+        act_pref = QAction("Preferences...", self)
+        act_pref.triggered.connect(self.open_preferences)
+        settings_menu.addAction(act_pref)
+
+        # View Menu
+        view_menu = menu_bar.addMenu("View")
+        def add_dock_toggle(dock):
+            action = dock.toggleViewAction()
+            view_menu.addAction(action)
+        add_dock_toggle(self.dock_nav)
+        add_dock_toggle(self.dock_analyst)
+
+    def update_header_title(self, text):
+        self.header_label.setText(text)
+
+    def open_preferences(self):
+        dlg = SettingsDialog(self.config_manager, self)
+        if dlg.exec():
+            vals = dlg.get_values()
+            
+            old_gap = self.config_manager.get("session_gap", default=30)
+            new_gap = vals["session_gap"]
+            
+            self.config_manager.set_global("session_gap", new_gap)
+            self.config_manager.set_global("startup_tab_mode", vals["startup_tab_mode"])
+            
+            if old_gap != new_gap:
+                self.refresh_stats()
+
+    # --- LOADING LOGIC ---
+
+    def auto_load(self):
+        saved_path = self.config_manager.get("stats_path")
+        if saved_path and Path(saved_path).exists():
+            self.start_loading(saved_path)
+            return
+
+        paths = [
+            Path("C:/Program Files (x86)/Steam/steamapps/common/FPSAimTrainer/FPSAimTrainer/stats"),
+            Path("D:/SteamLibrary/steamapps/common/FPSAimTrainer/FPSAimTrainer/stats")
+        ]
+        for p in paths:
+            if p.exists():
+                self.start_loading(str(p))
+                break
+
+    def select_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Stats Folder")
+        if folder:
+            self.config_manager.set_global("stats_path", folder)
+            self.start_loading(folder)
+
+    def refresh_stats(self):
+        if self.current_stats_path:
+            self.start_loading(self.current_stats_path)
+
+    def start_loading(self, path):
+        self.current_stats_path = path
+        self.btn_refresh.setEnabled(False)
+        self.btn_refresh.setText("Loading...")
+        
+        # Fetch gap from config
+        gap = self.config_manager.get("session_gap", default=30)
+        
+        self.worker = DataLoader(path, gap) # Pass gap
+        self.worker.finished.connect(self.on_data_loaded)
+        self.worker.start()
+
+    def on_data_loaded(self, df):
+        self.btn_refresh.setEnabled(True)
+        self.btn_refresh.setText("Refresh (F5)")
+        self.state_manager.data_updated.emit(df)
+        
+         # Only restore tabs once on startup
+        if self.is_initial_load:
+            self.grid_container.restore_state()
+            self.is_initial_load = False # Disable future restores
+
+    # --- PERSISTENCE ---
+    def closeEvent(self, event):
+        settings = {
+            "geometry": self.saveGeometry().toHex().data().decode(),
+            "windowState": self.saveState().toHex().data().decode(),
+            "splitterState": self.center_splitter.saveState().toHex().data().decode()
+        }
+        self.config_manager.set_global("app_layout", settings)
+        self.grid_container.save_state()
+        super().closeEvent(event)
+
+    def load_app_state(self):
+        settings = self.config_manager.get("app_layout", default={})
+        if "geometry" in settings:
+            self.restoreGeometry(QByteArray.fromHex(settings["geometry"].encode()))
+        if "windowState" in settings:
+            self.restoreState(QByteArray.fromHex(settings["windowState"].encode()))
+        if "splitterState" in settings:
+            self.center_splitter.restoreState(QByteArray.fromHex(settings["splitterState"].encode()))
+        else:
+            self.resizeDocks([self.dock_nav], [250], Qt.Orientation.Horizontal)
+            self.resizeDocks([self.dock_analyst], [400], Qt.Orientation.Horizontal)
+            self.center_splitter.setStretchFactor(0, 4)
+            self.center_splitter.setStretchFactor(1, 6)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = KovaaksV2App()
+    window.show()
+    sys.exit(app.exec())
+--- END OF FILE: main.py ---
+
+--- START OF FILE: modules\calendar\__init__.py ---
+
+--- END OF FILE: modules\calendar\__init__.py ---
+
+--- START OF FILE: modules\calendar\calendar_widget.py ---
+import datetime
+import calendar
+import pandas as pd
+import numpy as np
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
+                             QPushButton, QLabel, QFrame, QScrollArea, 
+                             QTableWidget, QTableWidgetItem, QHeaderView, 
+                             QAbstractItemView, QComboBox, QCheckBox)
+from PyQt6.QtCore import Qt, QDate, pyqtSignal
+from PyQt6.QtGui import QColor
+from modules.calendar.day_cell import DayCell
+from modules.calendar.daily_activity import DailyActivityWidget
+
+class DayDetailWidget(QWidget):
+    def __init__(self, state_manager, config_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        self.config = config_manager
+        self.day_df = None; self.full_df = None
+        
+        layout = QVBoxLayout(self); layout.setContentsMargins(0,0,0,0)
+        h_layout = QHBoxLayout()
+        self.lbl_title = QLabel("Select a day")
+        self.lbl_title.setStyleSheet("font-weight: bold; font-size: 14px; color: #d1d4dc;")
+        
+        self.chk_group = QCheckBox("Group by Scenario")
+        self.chk_group.stateChanged.connect(self.save_state)
+        self.chk_group.stateChanged.connect(self.refresh_table)
+        self.chk_group.setVisible(False)
+        
+        self.cb_sort = QComboBox()
+        self.cb_sort.addItems(["Most Played", "Performance", "Time", "A-Z"])
+        self.cb_sort.currentIndexChanged.connect(self.save_state)
+        self.cb_sort.currentIndexChanged.connect(self.refresh_table)
+        self.cb_sort.setVisible(False)
+        
+        h_layout.addWidget(self.lbl_title); h_layout.addStretch()
+        h_layout.addWidget(self.chk_group); h_layout.addSpacing(10)
+        h_layout.addWidget(QLabel("Sort:")); h_layout.addWidget(self.cb_sort)
+        layout.addLayout(h_layout)
+        
+        self.sess_container = QFrame()
+        self.sess_layout = QHBoxLayout(self.sess_container)
+        self.sess_layout.setContentsMargins(0,5,0,5); self.sess_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.sess_container)
+        
+        # --- RESTORED 75th COLUMN ---
+        self.table = QTableWidget()
+        cols = ["Scenario", "Runs", "Best", "vs Avg", "vs 75th", "vs PB", "Gain"]
+        self.table.setColumnCount(len(cols))
+        self.table.setHorizontalHeaderLabels(cols)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        h = self.table.horizontalHeader(); h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for i in range(1, len(cols)): h.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.table)
+        
+        self.load_state()
+
+    def save_state(self):
+        state = {"group_by": self.chk_group.isChecked(), "sort_mode": self.cb_sort.currentText()}
+        self.config.set_global("calendar_detail", state)
+
+    def load_state(self):
+        state = self.config.get("calendar_detail", default={})
+        if "group_by" in state: self.chk_group.setChecked(state["group_by"])
+        if "sort_mode" in state: self.cb_sort.setCurrentText(state["sort_mode"])
+
+    def load_day(self, date_str, daily_df, full_df):
+        self.day_df = daily_df; self.full_df = full_df
+        self.lbl_title.setText(f"Activity for {date_str}")
+        self.cb_sort.setVisible(True); self.chk_group.setVisible(True)
+        while self.sess_layout.count(): child = self.sess_layout.takeAt(0); child.widget().deleteLater() if child.widget() else None
+        sessions = sorted(daily_df['SessionID'].unique())
+        self.sess_layout.addWidget(QLabel("Sessions:"))
+        for sid in sessions:
+            btn = QPushButton(f"#{int(sid)}")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet("QPushButton { background: #2a2e39; border: 1px solid #363a45; padding: 2px 8px; color: #4aa3df; font-weight: bold; } QPushButton:hover { background: #363a45; border: 1px solid #4aa3df; }")
+            btn.clicked.connect(lambda ch, s=sid: self.state_manager.session_selected.emit(s))
+            self.sess_layout.addWidget(btn)
+        self.refresh_table()
+
+    def refresh_table(self):
+        if self.day_df is None or self.day_df.empty: return
+        group_by_scen = self.chk_group.isChecked()
+        if group_by_scen: grouped = self.day_df.groupby('Scenario')
+        else: grouped = self.day_df.groupby(['Scenario', 'Sens'])
+        rows = []
+        for key, group in grouped:
+            scen = key if group_by_scen else key[0]
+            sens = None if group_by_scen else key[1]
+            best_score = group['Score'].max(); run_count = len(group)
+            best_run_idx = group['Score'].idxmax(); best_run_time = group.loc[best_run_idx]['Timestamp']
+            
+            if group_by_scen: hist = self.full_df[self.full_df['Scenario'] == scen]
+            else: hist = self.full_df[(self.full_df['Scenario'] == scen) & (self.full_df['Sens'] == sens)]
+            prev_runs = hist[hist['Timestamp'] < best_run_time]
+            
+            prev_pb = 0; avg = 0; p75 = 0
+            if not prev_runs.empty:
+                prev_pb = prev_runs['Score'].max()
+                avg = prev_runs['Score'].mean()
+                p75 = prev_runs['Score'].quantile(0.75)
+            
+            gain_val = 0; gain_pct = 0; pb_status = "NONE"; vs_pb_pct = 0
+            if prev_runs.empty: pb_status = "NEW"
+            elif best_score > prev_pb:
+                pb_status = "PB"
+                gain_val = best_score - prev_pb
+                if prev_pb > 0: gain_pct = (gain_val / prev_pb) * 100
+                vs_pb_pct = 0 
+            else:
+                if prev_pb > 0: vs_pb_pct = ((best_score - prev_pb) / prev_pb) * 100
+
+            sort_val = 2 if pb_status == "PB" else (1 if pb_status == "NEW" else 0)
+            rows.append({
+                'name': scen, 'sens': sens, 'count': run_count, 'best': best_score,
+                'avg': avg, 'p75': p75, 'prev_pb': prev_pb,
+                'pb_status': pb_status, 'gain_val': gain_val, 'gain_pct': gain_pct, 'vs_pb_pct': vs_pb_pct,
+                'sort_val': sort_val, 'time': group['Timestamp'].min()
+            })
+            
+        mode = self.cb_sort.currentText()
+        if mode == "Most Played": rows.sort(key=lambda x: x['count'], reverse=True)
+        elif mode == "Performance": rows.sort(key=lambda x: (x['sort_val'], x['gain_pct']), reverse=True)
+        elif mode == "Time": rows.sort(key=lambda x: x['time']) 
+        elif mode == "A-Z": rows.sort(key=lambda x: x['name'])
+        
+        self.table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            name_txt = r['name']; 
+            if r['sens']: name_txt += f" ({r['sens']}cm)"
+            self.table.setItem(i, 0, QTableWidgetItem(name_txt))
+            item_runs = QTableWidgetItem(str(r['count']))
+            item_runs.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(i, 1, item_runs)
+            item_best = QTableWidgetItem(f"{r['best']:.0f}")
+            item_best.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(i, 2, item_best)
+            
+            def set_cell(col, val, color=None):
+                it = QTableWidgetItem(val); it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if color: it.setForeground(QColor(color))
+                self.table.setItem(i, col, it)
+
+            if r['pb_status'] == "NEW":
+                set_cell(3, "NEW!", "#4aa3df"); set_cell(4, "NEW!", "#4aa3df"); set_cell(5, "NEW!", "#4aa3df"); set_cell(6, "NEW!", "#4aa3df")
+            else:
+                avg_diff = ((r['best'] - r['avg'])/r['avg'])*100 if r['avg']>0 else 0
+                set_cell(3, f"{avg_diff:+.1f}%", "#4CAF50" if avg_diff>0 else "#EF5350")
+                
+                # vs 75th
+                p75_diff = ((r['best'] - r['p75'])/r['p75'])*100 if r['p75']>0 else 0
+                set_cell(4, f"{p75_diff:+.1f}%", "#4CAF50" if p75_diff>0 else "#EF5350")
+                
+                if r['pb_status'] == "PB":
+                    set_cell(5, "PB 🏆", "#FFD700")
+                    set_cell(6, f"+{r['gain_val']:.0f} (+{r['gain_pct']:.1f}%)", "#FFD700")
+                else:
+                    set_cell(5, f"{r['vs_pb_pct']:.1f}%", "#EF5350")
+                    set_cell(6, "-")
+
+class CalendarWidget(QWidget):
+    def __init__(self, state_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        # Init config manually since parent passes state_manager only
+        from core.config_manager import ConfigManager
+        self.config_manager = ConfigManager()
+        
+        self.full_df = None
+        self.current_date = QDate.currentDate(); self.selected_date = None; self.daily_stats = {} 
+        self.setup_ui(); self.state_manager.data_updated.connect(self.on_data_updated)
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self); layout.setContentsMargins(10,10,10,10)
+        
+        # --- FIXED NAV LAYOUT ---
+        top_bar = QHBoxLayout()
+        btn_prev = QPushButton("◀"); btn_prev.setFixedWidth(30); btn_prev.clicked.connect(self.prev_month)
+        
+        # Fixed width to prevent jumping
+        self.lbl_month = QLabel(); self.lbl_month.setFixedWidth(160) 
+        self.lbl_month.setStyleSheet("font-weight: bold; font-size: 16px; color: #d1d4dc;")
+        self.lbl_month.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        btn_next = QPushButton("▶"); btn_next.setFixedWidth(30); btn_next.clicked.connect(self.next_month)
+        btn_today = QPushButton("Today"); btn_today.clicked.connect(self.go_today)
+        
+        top_bar.addWidget(btn_prev); top_bar.addWidget(self.lbl_month); top_bar.addWidget(btn_next); top_bar.addWidget(btn_today)
+        top_bar.addStretch()
+        
+        # --- LEGEND ---
+        lbl_legend = QLabel("🏆 Scen PB   🎯 Sens PB")
+        lbl_legend.setStyleSheet("color: #787b86; font-size: 11px; margin-right: 5px;")
+        top_bar.addWidget(lbl_legend)
+        
+        layout.addLayout(top_bar)
+        
+        self.grid_layout = QGridLayout(); self.grid_layout.setSpacing(5)
+        days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        for i, d in enumerate(days):
+            lbl = QLabel(d); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter); lbl.setStyleSheet("color: #787b86; font-weight: bold;")
+            self.grid_layout.addWidget(lbl, 0, i)
+        self.cells = []
+        for row in range(1, 7):
+            for col in range(7):
+                cell = DayCell(); cell.clicked.connect(self.on_day_clicked)
+                self.grid_layout.addWidget(cell, row, col); self.cells.append(cell)
+        layout.addLayout(self.grid_layout)
+
+        # DAILY ACTIVITY GRAPH 
+        layout.addSpacing(10)
+        self.activity_graph = DailyActivityWidget()
+        layout.addWidget(self.activity_graph)
+        
+        # DETAIL PANEL
+        layout.addSpacing(10)
+        self.detail_panel = DayDetailWidget(self.state_manager, self.config_manager)
+        layout.addWidget(self.detail_panel, stretch=1)
+        self.update_calendar()
+
+
+
+    def on_data_updated(self, df):
+        if df is None: return
+        self.full_df = df
+        
+        if 'DateStr' not in df.columns:
+            df['DateStr'] = df['Timestamp'].dt.strftime('%Y-%m-%d')
+            
+        grouped = df.groupby('DateStr')
+        self.daily_stats = {}
+        
+        for date_str, group in grouped:
+            valid_sens_pbs = group[(group['Is_PB'] == 1) & (group.get('Is_First', False) == 0)]
+            valid_scen_pbs = group[(group['Is_Scen_PB'] == 1) & (group.get('Is_First', False) == 0)]
+            
+            stats = {
+                'runs': len(group),
+                'duration': group['Duration'].sum(),
+                'pbs_scen': len(valid_scen_pbs), 
+                'pbs_sens': len(valid_sens_pbs),
+                'sessions': group['SessionID'].unique().tolist()
+            }
+            self.daily_stats[date_str] = stats
+            
+        # --- AUTO-SELECT LATEST DAY ---
+        if self.daily_stats:
+            latest_str = max(self.daily_stats.keys())
+            latest_py_date = datetime.datetime.strptime(latest_str, '%Y-%m-%d').date()
+            
+            self.current_date = QDate(latest_py_date.year, latest_py_date.month, 1)
+            self.selected_date = latest_py_date
+            
+            self.update_calendar()
+            
+            # Load Data for Detail & Graph
+            day_df = df[df['DateStr'] == latest_str].copy()
+            self.detail_panel.load_day(latest_str, day_df, df)
+            self.activity_graph.load_data(day_df) # <--- Added this line
+        else:
+            self.update_calendar()
+
+    def update_calendar(self):
+        year, month = self.current_date.year(), self.current_date.month()
+        self.lbl_month.setText(f"{calendar.month_name[month]} {year}")
+        month_prefix = f"{year}-{month:02d}"
+        month_durations = [v['duration'] for k,v in self.daily_stats.items() if k.startswith(month_prefix)]
+        max_act = max(month_durations) if month_durations else 3600
+        first_day = QDate(year, month, 1)
+        start_day_of_week = first_day.dayOfWeek() - 1
+        current_grid_date = first_day.addDays(-start_day_of_week)
+        for cell in self.cells:
+            py_date = datetime.date(current_grid_date.year(), current_grid_date.month(), current_grid_date.day())
+            date_str = py_date.strftime('%Y-%m-%d')
+            stats = self.daily_stats.get(date_str, None)
+            is_current = (current_grid_date.month() == month)
+            is_sel = (self.selected_date == py_date)
+            cell.set_data(py_date, stats, is_current, max_act, is_sel)
+            current_grid_date = current_grid_date.addDays(1)
+
+    def prev_month(self): self.current_date = self.current_date.addMonths(-1); self.update_calendar()
+    def next_month(self): self.current_date = self.current_date.addMonths(1); self.update_calendar()
+    def go_today(self): self.current_date = QDate.currentDate(); self.update_calendar()
+    def on_day_clicked(self, py_date):
+        self.selected_date = py_date
+        self.update_calendar()
+        
+        if self.full_df is not None:
+            date_str = py_date.strftime('%Y-%m-%d')
+            # Filter main DF for this day
+            # Use .copy() to ensure we don't get SettingWithCopy warnings in the graph widget
+            day_df = self.full_df[self.full_df['DateStr'] == date_str].copy()
+            
+            # 1. Load Detail Panel
+            self.detail_panel.load_day(date_str, day_df, self.full_df)
+            
+            # 2. Load Activity Graph
+            self.activity_graph.load_data(day_df)
+--- END OF FILE: modules\calendar\calendar_widget.py ---
+
+--- START OF FILE: modules\calendar\daily_activity.py ---
+import numpy as np
+import pandas as pd
+import pyqtgraph as pg
+from PyQt6.QtWidgets import QWidget, QVBoxLayout
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor, QFont
+
+class DailyActivityWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.setFixedHeight(100) # Compact height
+        
+        # Plot Setup
+        pg.setConfigOption('background', '#131722')
+        pg.setConfigOption('foreground', '#d1d4dc')
+        pg.setConfigOptions(antialias=True)
+        
+        self.plot = pg.PlotWidget()
+        self.plot.showGrid(x=False, y=False)
+        self.plot.setMouseEnabled(x=False, y=False)
+        self.plot.hideButtons()
+        
+        # Axis Style
+        ax_b = self.plot.getAxis('bottom')
+        ax_b.setTicks([
+            [(0, '00:00'), (6, '06:00'), (12, '12:00'), (18, '18:00'), (24, '24:00')],
+            []
+        ])
+        ax_b.setPen(color='#363a45')
+        ax_b.setTextPen(color='#787b86')
+        
+        self.plot.getAxis('left').hide()
+        self.plot.setYRange(0, 0.60) # Fixed range 0% to 60%
+        self.plot.setXRange(0, 24)
+        
+        layout.addWidget(self.plot)
+
+    def load_data(self, day_df):
+        self.plot.clear()
+        if day_df is None or day_df.empty: return
+        
+        # 1. Activity Curve (30m)
+        bins = np.zeros(48)
+        day_start = day_df['Timestamp'].min().floor('D')
+        start_ts = day_start.timestamp()
+        
+        for _, row in day_df.iterrows():
+            rel_sec = row['Timestamp'].timestamp() - start_ts
+            rel_hour = rel_sec / 3600.0
+            bin_idx = int(rel_hour * 2) 
+            if 0 <= bin_idx < 48: bins[bin_idx] += row['Duration'] / 1800.0
+
+        data = pd.Series(bins)
+        smoothed = data.rolling(window=3, center=True, min_periods=1).mean().values
+        x_axis = np.linspace(0, 24, 48)
+        c = QColor("#4CAF50"); c.setAlpha(50)
+        brush = pg.mkBrush(c); pen = pg.mkPen("#4CAF50", width=2)
+        self.plot.plot(x_axis, smoothed, pen=pen, brush=brush, fillLevel=0)
+        
+        # 2. PB Markers (10m)
+        pb_bins = {}
+        pbs = day_df[(day_df['Is_PB'] == 1) | (day_df.get('Is_Scen_PB', 0) == 1)]
+        
+        for _, row in pbs.iterrows():
+            if row.get('Is_First', False): continue
+            
+            rel_sec = row['Timestamp'].timestamp() - start_ts
+            bin_idx = int((rel_sec / 3600.0) * 6)
+            
+            if bin_idx not in pb_bins: pb_bins[bin_idx] = {'scen': 0, 'sens': 0}
+            
+            if row.get('Is_Scen_PB', 0) == 1: pb_bins[bin_idx]['scen'] += 1
+            elif row.get('Is_PB', 0) == 1: pb_bins[bin_idx]['sens'] += 1
+                
+        # Draw Icons
+        for b_idx, counts in pb_bins.items():
+            x_pos = (b_idx / 6.0) + (1/12.0)
+            
+            # Helper to get size
+            def get_font(cnt):
+                f = QFont()
+                if cnt >= 3: f.setPointSize(18)   # Large
+                elif cnt == 2: f.setPointSize(14) # Medium
+                else: f.setPointSize(10)          # Small
+                return f
+
+            # Scen (Top)
+            if counts['scen'] > 0:
+                item = pg.TextItem("🏆", color="#FFD700", anchor=(0.5, 0.5))
+                item.setFont(get_font(counts['scen']))
+                item.setPos(x_pos, 0.55)
+                self.plot.addItem(item)
+                
+            # Sens (Bottom)
+            if counts['sens'] > 0:
+                item = pg.TextItem("🎯", color="#00E5FF", anchor=(0.5, 0.5))
+                item.setFont(get_font(counts['sens']))
+                item.setPos(x_pos, 0.45)
+                self.plot.addItem(item)
+--- END OF FILE: modules\calendar\daily_activity.py ---
+
+--- START OF FILE: modules\calendar\day_cell.py ---
+from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel, QHBoxLayout
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
+
+class DayCell(QFrame):
+    clicked = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.date = None
+        self.is_selected = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(2,2,2,2)
+        self.layout.setSpacing(0)
+        
+        # Row 1: Date | Time
+        r1 = QHBoxLayout()
+        self.lbl_date = QLabel()
+        self.lbl_date.setStyleSheet("font-weight: bold; color: #787b86;")
+        self.lbl_time = QLabel()
+        self.lbl_time.setStyleSheet("font-size: 10px; color: #4aa3df;")
+        r1.addWidget(self.lbl_date); r1.addStretch(); r1.addWidget(self.lbl_time)
+        self.layout.addLayout(r1)
+        
+        # Row 2: Runs
+        self.lbl_runs = QLabel()
+        self.lbl_runs.setStyleSheet("font-size: 10px; color: #d1d4dc;")
+        self.lbl_runs.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.layout.addWidget(self.lbl_runs)
+        
+        # Row 3: PBs (Scen | Sens)
+        r3 = QHBoxLayout()
+        self.lbl_pb_scen = QLabel()
+        self.lbl_pb_scen.setStyleSheet("font-size: 10px; color: #FFD700;")
+        self.lbl_pb_sens = QLabel()
+        self.lbl_pb_sens.setStyleSheet("font-size: 10px; color: #FFD700;")
+        r3.addWidget(self.lbl_pb_scen); r3.addStretch(); r3.addWidget(self.lbl_pb_sens)
+        self.layout.addLayout(r3)
+        
+        self.layout.addStretch()
+
+    def set_data(self, date, stats, is_current_month, max_activity, is_selected):
+        self.date = date
+        self.is_selected = is_selected
+        
+        day_str = str(date.day)
+        if date.day == 1: day_str = date.strftime("%b %d")
+        self.lbl_date.setText(day_str)
+        
+        # Reset
+        self.lbl_time.setText(""); self.lbl_runs.setText("")
+        self.lbl_pb_scen.setText(""); self.lbl_pb_sens.setText("")
+        
+        if not is_current_month:
+            self.setStyleSheet(f"background: #131722; border: 1px solid #2B2B43;"); self.lbl_date.setStyleSheet("color: #444;")
+            self.setEnabled(False)
+            return
+        
+        self.setEnabled(True)
+        self.lbl_date.setStyleSheet("font-weight: bold; color: #787b86;")
+
+        bg_color = "#1e222d"
+        
+        if stats:
+            dur_min = int(stats['duration'] // 60)
+            self.lbl_time.setText(f"{dur_min}m")
+            self.lbl_runs.setText(f"{stats['runs']} runs")
+            
+            scen_pb = stats.get('pbs_scen', 0)
+            sens_pb = stats.get('pbs_sens', 0)
+            
+            # Format: "3 🏆" | "5 🎯"
+            if scen_pb > 0: self.lbl_pb_scen.setText(f"{scen_pb} 🏆")
+            if sens_pb > 0: self.lbl_pb_sens.setText(f"{sens_pb} 🎯")
+            
+            if max_activity > 0:
+                intensity = min(1.0, stats['duration'] / max_activity)
+                alpha = int(intensity * 120) + 20
+                bg_color = f"rgba(46, 125, 50, {alpha})"
+        
+        border = "#2962FF" if is_selected else "#363a45"
+        width = "2px" if is_selected else "1px"
+        self.setStyleSheet(f"QFrame {{ background-color: {bg_color}; border: {width} solid {border}; border-radius: 4px; }} QLabel {{ background: transparent; border: none; }}")
+
+    def mousePressEvent(self, event):
+        if self.isEnabled(): self.clicked.emit(self.date)
+        super().mousePressEvent(event)
+--- END OF FILE: modules\calendar\day_cell.py ---
+
+--- START OF FILE: modules\career\career_widget.py ---
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, 
+                             QScrollArea, QGridLayout, QToolButton)
+from PyQt6.QtCore import Qt
+import pandas as pd
+from core.analytics import stats as engine
+from core import locales
+
+class CareerWidget(QWidget):
+    def __init__(self, state_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        self.full_df = None
+        self.setup_ui()
+        self.state_manager.data_updated.connect(self.on_data_updated)
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("background: #131722; border: none;")
+        layout.addWidget(self.scroll)
+        
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(20, 20, 20, 20)
+        self.content_layout.setSpacing(20)
+        self.scroll.setWidget(self.content)
+
+    def on_data_updated(self, df):
+        if df is None: return
+        self.full_df = df
+        
+        # Calculate Stats
+        stats = engine.calculate_profile_stats(df)
+        self.render_view(stats)
+
+    def render_view(self, stats):
+        # Clear
+        while self.content_layout.count():
+            item = self.content_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        # 1. TOP STATS GRID
+        grid_frame = QFrame()
+        grid = QGridLayout(grid_frame)
+        grid.setSpacing(15)
+        
+        # Using keys for future localization
+        self.add_stat_card(grid, 0, 0, locales.get_text("cp_total_runs", "Total Runs"), f"{stats['total_runs']:,}")
+        self.add_stat_card(grid, 0, 1, locales.get_text("cp_active_time", "Active Playtime"), engine.format_timedelta_hours(stats['active_time']))
+        self.add_stat_card(grid, 0, 2, locales.get_text("cp_total_pbs", "Total PBs"), f"{stats['total_pbs']:,}")
+        self.add_stat_card(grid, 1, 0, locales.get_text("cp_scenarios", "Unique Scenarios"), f"{stats['unique_scens']:,}")
+        self.add_stat_card(grid, 1, 1, locales.get_text("cp_combos", "Unique Combos"), f"{stats['unique_combos']:,}")
+        
+        self.content_layout.addWidget(grid_frame)
+
+        # 2. RANKS
+        lbl_rank = QLabel(locales.get_text("cp_ranks", "Rank Distribution"))
+        lbl_rank.setStyleSheet("font-weight: bold; font-size: 16px; margin-top: 10px;")
+        self.content_layout.addWidget(lbl_rank)
+        
+        rank_frame = QFrame()
+        r_layout = QHBoxLayout(rank_frame)
+        r_layout.setSpacing(10)
+        
+        # Order: Transmute -> Singularity
+        rank_order = ["TRANSMUTE", "BLESSED", "EXALTED", "UBER", "ARCADIA", "SINGULARITY"]
+        colors = ["#448AFF", "#FF5252", "#FDD835", "#673AB7", "#2E7D32", "#000000"]
+        
+        for i, name in enumerate(rank_order):
+            count = stats['ranks'].get(name, 0)
+            self.add_rank_card(r_layout, name, count, colors[i])
+            
+        self.content_layout.addWidget(rank_frame)
+
+        # 3. MONTHLY ARCHIVES
+        lbl_hist = QLabel(locales.get_text("cp_history", "Monthly History"))
+        lbl_hist.setStyleSheet("font-weight: bold; font-size: 16px; margin-top: 10px;")
+        self.content_layout.addWidget(lbl_hist)
+        
+        # Group by Month
+        df = self.full_df.copy()
+        df['Month'] = df['Timestamp'].dt.to_period('M')
+        
+        for period in sorted(df['Month'].unique(), reverse=True):
+            m_df = df[df['Month'] == period]
+            self.add_month_row(period.strftime("%B %Y"), len(m_df), m_df['Duration'].sum())
+
+        self.content_layout.addStretch()
+
+    def add_stat_card(self, grid, r, c, label, value):
+        frame = QFrame()
+        frame.setStyleSheet("background: #1e222d; border-radius: 6px; border: 1px solid #363a45;")
+        lay = QVBoxLayout(frame)
+        
+        l1 = QLabel(label.upper())
+        l1.setStyleSheet("color: #787b86; font-size: 10px; font-weight: bold;")
+        l2 = QLabel(str(value))
+        l2.setStyleSheet("color: #d1d4dc; font-size: 20px; font-weight: bold;")
+        
+        lay.addWidget(l1)
+        lay.addWidget(l2)
+        grid.addWidget(frame, r, c)
+
+    def add_rank_card(self, layout, name, count, color):
+        frame = QFrame()
+        frame.setStyleSheet(f"background: {color}; border-radius: 4px;")
+        frame.setMinimumWidth(80)
+        lay = QVBoxLayout(frame)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        txt_col = "white" if name in ["SINGULARITY", "UBER", "ARCADIA"] else "black"
+        
+        l1 = QLabel(name[:3]) # Short name
+        l1.setStyleSheet(f"color: {txt_col}; font-size: 10px; font-weight: bold;")
+        l2 = QLabel(str(count))
+        l2.setStyleSheet(f"color: {txt_col}; font-size: 16px; font-weight: bold;")
+        
+        lay.addWidget(l1)
+        lay.addWidget(l2)
+        layout.addWidget(frame)
+
+    def add_month_row(self, title, runs, duration):
+        frame = QFrame()
+        frame.setStyleSheet("background: #1e222d; border-radius: 4px; border-left: 3px solid #2962FF;")
+        lay = QHBoxLayout(frame)
+        
+        lay.addWidget(QLabel(title))
+        lay.addStretch()
+        
+        dur_str = engine.format_timedelta_hours(duration)
+        info = f"{runs} Runs | {dur_str}"
+        lay.addWidget(QLabel(info))
+        
+        self.content_layout.addWidget(frame)
+--- END OF FILE: modules\career\career_widget.py ---
+
+--- START OF FILE: modules\charts\chart_widget.py ---
+import datetime
+import numpy as np
+import pandas as pd
+import pyqtgraph as pg
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
+                             QCheckBox, QSpinBox, QFrame, QDoubleSpinBox, QPushButton, QButtonGroup)
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QBrush, QPen, QFont
+from core.config_manager import ConfigManager
+
+# --- COLOR PALETTES ---
+COLORS_CYCLE_10 = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', 
+    '#9467bd', '#8c564b', '#e377c2', '#7f7f0f', 
+    '#bcbd22', '#17becf'
+]
+COLORS_CYCLE_4 = [
+    '#1f77b4', '#ff7f0e', '#9467bd', '#d62728'
+]
+
+class DateAxis(pg.AxisItem):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.index_to_time = {}
+    def set_lookup(self, lookup_dict): self.index_to_time = lookup_dict
+    def tickStrings(self, values, scale, spacing):
+        strings = []
+        for v in values:
+            idx = int(v)
+            if idx in self.index_to_time:
+                dt = datetime.datetime.fromtimestamp(self.index_to_time[idx])
+                strings.append(dt.strftime('%b %d'))
+            else: strings.append("")
+        return strings
+
+class ChartToolbar(QFrame):
+    param_changed = pyqtSignal()
+    # ... (Toolbar code remains exactly the same as previous version) ...
+    # To save space, I am condensing the toolbar init code since it hasn't changed.
+    # Please ensure you keep the ChartToolbar class we built in the previous step.
+    def __init__(self, config_manager):
+        super().__init__()
+        self.config = config_manager
+        self.setStyleSheet("background: #1e222d; border-bottom: 1px solid #363a45;")
+        self.setFixedHeight(85)
+        main_layout = QVBoxLayout(self); main_layout.setContentsMargins(5, 5, 5, 5); main_layout.setSpacing(5)
+        row1 = QHBoxLayout(); row1.setSpacing(5)
+        self.mode_group = QButtonGroup(); self.mode_group.setExclusive(True); self.mode_group.buttonClicked.connect(self.param_changed)
+        modes = ["Raw Data", "Grouped Avg", "Daily Avg", "Weekly Avg", "Monthly Avg", "Session Avg"]
+        self.mode_btns = {}
+        for m in modes:
+            btn = QPushButton(m); btn.setCheckable(True)
+            btn.setStyleSheet("""QPushButton { background: #2a2e39; border: none; padding: 4px 8px; color: #787b86; font-size: 11px; } QPushButton:checked { background: #2962FF; color: white; font-weight: bold; } QPushButton:hover { background: #363a45; }""")
+            self.mode_group.addButton(btn); row1.addWidget(btn); self.mode_btns[m] = btn
+        self.mode_btns["Raw Data"].setChecked(True)
+        row1.addSpacing(10)
+        self.cb_visual = QComboBox(); self.cb_visual.addItems(["Line Plot", "Dot Only", "Filled Area"]); self.cb_visual.currentIndexChanged.connect(self.param_changed); row1.addWidget(self.cb_visual)
+        row1.addStretch()
+        self.chk_color = QCheckBox("Color by Session"); self.chk_color.setChecked(True); self.chk_color.stateChanged.connect(self.on_color_toggled); self.chk_color.stateChanged.connect(self.param_changed); row1.addWidget(self.chk_color)
+        self.chk_4color = QCheckBox("4-Color Cycle"); self.chk_4color.setVisible(True); self.chk_4color.stateChanged.connect(self.param_changed); row1.addWidget(self.chk_4color)
+        main_layout.addLayout(row1)
+        row2 = QHBoxLayout(); row2.setSpacing(15)
+        row2.addWidget(QLabel("Hide <")); self.sb_hide = QDoubleSpinBox(); self.sb_hide.setRange(0, 999999); self.sb_hide.setValue(5); self.sb_hide.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons); self.sb_hide.setFixedWidth(60); self.sb_hide.valueChanged.connect(self.param_changed); row2.addWidget(self.sb_hide)
+        self.chk_connect = QCheckBox("Connect Sessions"); self.chk_connect.stateChanged.connect(self.param_changed); row2.addWidget(self.chk_connect)
+        self.lbl_group = QLabel("N="); self.sb_group = QSpinBox(); self.sb_group.setRange(2, 100); self.sb_group.setValue(5); self.sb_group.valueChanged.connect(self.param_changed); row2.addWidget(self.lbl_group); row2.addWidget(self.sb_group); self.set_group_visible(False)
+        row2.addStretch()
+        self.chk_trend = QCheckBox("Trend"); self.chk_trend.setStyleSheet("color: #FF9800; font-weight: bold;"); self.chk_trend.stateChanged.connect(self.param_changed); row2.addWidget(self.chk_trend)
+        self.smas = []
+        colors = ['#FFFFFF', '#00E5FF', '#76FF03']; defaults = [5, 10, 50]
+        for i in range(3):
+            f = QFrame(); l = QHBoxLayout(f); l.setContentsMargins(0,0,0,0); l.setSpacing(5)
+            chk = QCheckBox("SMA"); chk.setStyleSheet(f"color: {colors[i]}"); chk.stateChanged.connect(self.param_changed)
+            sb = QSpinBox(); sb.setRange(2, 999); sb.setValue(defaults[i]); sb.setFixedWidth(60); sb.valueChanged.connect(self.param_changed)
+            l.addWidget(chk); l.addWidget(sb); row2.addWidget(f); self.smas.append({'chk': chk, 'sb': sb, 'color': colors[i]})
+        main_layout.addLayout(row2)
+        self.on_color_toggled(); self.load_global_state()
+    def on_color_toggled(self): self.chk_4color.setVisible(self.chk_color.isChecked())
+    def set_group_visible(self, visible): self.lbl_group.setVisible(visible); self.sb_group.setVisible(visible)
+    def get_mode(self): btn = self.mode_group.checkedButton(); return btn.text() if btn else "Raw Data"
+    def save_global_state(self):
+        state = {"group_n": self.sb_group.value(), "color_by_session": self.chk_color.isChecked(), "use_4_color": self.chk_4color.isChecked(), "connect_sessions": self.chk_connect.isChecked(), "career_trend": self.chk_trend.isChecked(), "smas": [{'on': s['chk'].isChecked(), 'val': s['sb'].value()} for s in self.smas]}
+        self.config.set_global("chart_global", state)
+    def load_global_state(self):
+        state = self.config.get("chart_global", default={});
+        if not state: return
+        if "group_n" in state: self.sb_group.setValue(state["group_n"])
+        if "color_by_session" in state: self.chk_color.setChecked(state["color_by_session"])
+        if "use_4_color" in state: self.chk_4color.setChecked(state["use_4_color"])
+        if "connect_sessions" in state: self.chk_connect.setChecked(state["connect_sessions"])
+        if "career_trend" in state: self.chk_trend.setChecked(state["career_trend"])
+        if "smas" in state:
+            for i, d in enumerate(state["smas"]):
+                if i < len(self.smas): self.smas[i]['chk'].setChecked(d['on']); self.smas[i]['sb'].setValue(d['val'])
+        self.on_color_toggled()
+
+class ChartWidget(QWidget):
+    def __init__(self, state_manager, listen_to_global_signals=True):
+        super().__init__()
+        self.state_manager = state_manager
+        self.listen_to_global = listen_to_global_signals
+        self.config = ConfigManager()
+        self.all_runs_df = None; self.current_data_df = None; self.active_scenario_key = None
+        self.index_to_time_map = {}
+        
+        # NEW: Store metadata for tooltips
+        self.index_to_meta = {} 
+        
+        self.layout = QVBoxLayout(self); self.layout.setContentsMargins(0, 0, 0, 0); self.layout.setSpacing(0)
+        self.toolbar = ChartToolbar(self.config); self.toolbar.param_changed.connect(self.reprocess_and_plot); self.toolbar.sb_hide.valueChanged.connect(self.save_per_graph_settings)
+        self.toolbar.chk_color.stateChanged.connect(self.toolbar.save_global_state); self.toolbar.chk_4color.stateChanged.connect(self.toolbar.save_global_state); self.toolbar.chk_connect.stateChanged.connect(self.toolbar.save_global_state); self.toolbar.chk_trend.stateChanged.connect(self.toolbar.save_global_state); self.toolbar.sb_group.valueChanged.connect(self.toolbar.save_global_state)
+        for s in self.toolbar.smas: s['chk'].stateChanged.connect(self.toolbar.save_global_state); s['sb'].valueChanged.connect(self.toolbar.save_global_state)
+        if self.listen_to_global: self.layout.addWidget(self.toolbar)
+        else: self.toolbar.hide()
+        pg.setConfigOption('background', '#131722'); pg.setConfigOption('foreground', '#d1d4dc'); pg.setConfigOptions(antialias=True)
+        self.date_axis = DateAxis(orientation='top'); self.plot_widget = pg.PlotWidget(axisItems={'top': self.date_axis}); self.plot_widget.showGrid(x=True, y=True, alpha=0.5); self.plot_widget.getAxis('bottom').setLabel("Run Number")
+        for ax in ['bottom', 'left', 'top']: self.plot_widget.getAxis(ax).setPen(color='#363a45'); self.plot_widget.getAxis(ax).setTextPen(color='#787b86')
+        self.layout.addWidget(self.plot_widget); self.setup_overlays()
+        self.state_manager.data_updated.connect(self.on_data_updated)
+        if self.listen_to_global: self.state_manager.scenario_selected.connect(self.on_sidebar_selected); self.state_manager.variant_selected.connect(self.on_variant_selected)
+
+    def setup_overlays(self):
+        self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#787b86', style=Qt.PenStyle.DashLine)); self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#787b86', style=Qt.PenStyle.DashLine)); self.plot_widget.addItem(self.v_line, ignoreBounds=True); self.plot_widget.addItem(self.h_line, ignoreBounds=True)
+        self.label = pg.TextItem(text="", color="#d1d4dc", anchor=(0, 1)); self.plot_widget.addItem(self.label, ignoreBounds=True)
+        self.proxy = pg.SignalProxy(self.plot_widget.scene().sigMouseMoved, rateLimit=60, slot=self.mouse_moved)
+        self.title_lbl = pg.TextItem(text="", color="#d1d4dc", anchor=(0, 0))
+        font = QFont(); font.setBold(True); font.setPointSize(14); self.title_lbl.setFont(font); self.plot_widget.addItem(self.title_lbl)
+
+    def mouse_moved(self, evt):
+        pos = evt[0]
+        if self.plot_widget.sceneBoundingRect().contains(pos):
+            mouse_point = self.plot_widget.plotItem.vb.mapSceneToView(pos)
+            index = int(round(mouse_point.x()))
+            self.v_line.setPos(index)
+            self.h_line.setPos(mouse_point.y())
+            
+            # --- UPDATED TOOLTIP LOGIC ---
+            text_lines = []
+            
+            # 1. Date
+            idx_map = getattr(self, 'index_to_time_map', {})
+            if index in idx_map:
+                dt = datetime.datetime.fromtimestamp(idx_map[index])
+                text_lines.append(dt.strftime('%Y-%m-%d %H:%M'))
+            
+            # 2. Rich Metadata (Scenario Info)
+            meta_map = getattr(self, 'index_to_meta', {})
+            if index in meta_map:
+                m = meta_map[index]
+                if 'scenario' in m:
+                    line = m['scenario']
+                    if m.get('sens'): line += f" ({m['sens']}cm)"
+                    text_lines.append(line)
+                if 'score' in m:
+                    text_lines.append(f"Score: {m['score']:.1f}")
+                if 'subtext' in m:
+                    text_lines.append(m['subtext'])
+            else:
+                # Default (Value only)
+                text_lines.append(f"{mouse_point.y():.1f}")
+
+            self.label.setText("\n".join(text_lines))
+            self.label.setPos(index, mouse_point.y())
+
+    def on_data_updated(self, df): self.all_runs_df = df
+    def on_sidebar_selected(self, scenario_name): self.load_graph(scenario_name, None)
+    def on_variant_selected(self, payload): self.load_graph(payload['scenario'], payload['sens'])
+
+    def load_graph(self, scenario_name, sens_val):
+        if self.all_runs_df is None: return
+        mask = self.all_runs_df['Scenario'] == scenario_name; df = self.all_runs_df[mask].copy()
+        if sens_val is not None: df = df[df['Sens'] == sens_val]; self.active_scenario_key = f"{scenario_name}_{sens_val}cm"; display_title = f"{scenario_name} ({sens_val}cm)"
+        else: self.active_scenario_key = scenario_name; display_title = f"{scenario_name} (All Sens)"
+        if df.empty: self.plot_widget.clear(); self.state_manager.chart_title_changed.emit("No Data"); self.current_data_df = None; return
+        df.sort_values('Timestamp', inplace=True); self.current_data_df = df; self.current_display_title = display_title
+        saved = self.config.get("chart_settings", scenario=self.active_scenario_key, default={}); val = saved.get("hide_low", 5.0)
+        self.toolbar.sb_hide.blockSignals(True); self.toolbar.sb_hide.setValue(val); self.toolbar.sb_hide.blockSignals(False); self.reprocess_and_plot()
+
+    def save_per_graph_settings(self):
+        if self.active_scenario_key: self.config.set_scenario(self.active_scenario_key, "chart_settings", {"hide_low": self.toolbar.sb_hide.value()})
+
+    def reprocess_and_plot(self):
+        if self.current_data_df is None: return
+        df = self.current_data_df.copy()
+        cutoff = self.toolbar.sb_hide.value();
+        if cutoff > 0: df = df[df['Score'] >= cutoff]
+        if df.empty: self.plot_widget.clear(); self.state_manager.chart_title_changed.emit("Filtered to Empty"); return
+        self.plot_widget.clear(); self.plot_widget.addItem(self.v_line, ignoreBounds=True); self.plot_widget.addItem(self.h_line, ignoreBounds=True); self.plot_widget.addItem(self.label, ignoreBounds=True); self.index_to_time_map = {}
+        mode = self.toolbar.get_mode(); vis_style = self.toolbar.cb_visual.currentText(); use_connect = self.toolbar.chk_connect.isChecked(); color_by_sess = self.toolbar.chk_color.isChecked(); use_4_color = self.toolbar.chk_4color.isChecked()
+        self.toolbar.set_group_visible(mode == "Grouped Avg")
+        segments = []; ACTIVE_CYCLE = COLORS_CYCLE_4 if use_4_color else COLORS_CYCLE_10
+        if 'SessionID' in df.columns: u_sess = sorted(df['SessionID'].unique()); sess_map = {sid: i for i, sid in enumerate(u_sess)}
+        else: sess_map = {}
+        def get_sess_color(sid):
+            if not color_by_sess: return '#2962FF'
+            seq_idx = sess_map.get(sid, 0); return ACTIVE_CYCLE[seq_idx % len(ACTIVE_CYCLE)]
+        if mode == "Raw Data":
+            y_all = df['Score'].values; x_all = np.arange(len(y_all));
+            for i, ts in enumerate(df['Timestamp'].apply(lambda t: t.timestamp())): self.index_to_time_map[i] = ts
+            if 'SessionID' in df.columns:
+                df['idx'] = x_all
+                for sid, group in df.groupby('SessionID', sort=False): segments.append({'x': group['idx'].values, 'y': group['Score'].values, 'color': get_sess_color(int(sid))})
+            else: segments.append({'x': x_all, 'y': y_all, 'color': '#2962FF'})
+        else:
+            if mode == "Grouped Avg": n = self.toolbar.sb_group.value(); df['Group'] = np.arange(len(df)) // n; grouped = df.groupby('Group')
+            elif mode == "Session Avg": grouped = df.groupby('SessionID')
+            elif mode == "Daily Avg": grouped = df.groupby(pd.Grouper(key='Timestamp', freq='D'))
+            elif mode == "Weekly Avg": grouped = df.groupby(pd.Grouper(key='Timestamp', freq='W'))
+            elif mode == "Monthly Avg": grouped = df.groupby(pd.Grouper(key='Timestamp', freq='M'))
+            agg = grouped['Score'].mean().dropna(); agg_t = grouped['Timestamp'].max().dropna(); common = agg.index.intersection(agg_t.index); agg = agg.loc[common]; agg_t = agg_t.loc[common]
+            y_vals = agg.values; x_vals = np.arange(len(y_vals));
+            for i, ts in enumerate(agg_t.apply(lambda t: t.timestamp())): self.index_to_time_map[i] = ts
+            segments.append({'x': x_vals, 'y': y_vals, 'color': '#FF9800'})
+        for i, seg in enumerate(segments):
+            x = seg['x']; y = seg['y']; c = seg['color']; scatter = pg.ScatterPlotItem(x=x, y=y, size=6, brush=pg.mkBrush(c), pen=pg.mkPen(None)); self.plot_widget.addItem(scatter)
+            if vis_style in ["Line Plot", "Filled Area"]:
+                pen = pg.mkPen(c, width=2); brush = None
+                if vis_style == "Filled Area": col = QColor(c); col.setAlpha(50); brush = pg.mkBrush(col)
+                self.plot_widget.plot(x, y, pen=pen, brush=brush, fillLevel=0 if brush else None)
+            if use_connect and i < len(segments) - 1:
+                next_seg = segments[i+1]; x_b = [x[-1], next_seg['x'][0]]; y_b = [y[-1], next_seg['y'][0]]; c_b = next_seg['color']; pen_b = pg.mkPen(c_b, width=2); self.plot_widget.plot(x_b, y_b, pen=pen_b)
+                if vis_style == "Filled Area": col = QColor(c_b); col.setAlpha(50); brush = pg.mkBrush(col); self.plot_widget.plot(x_b, y_b, pen=pen_b, brush=brush, fillLevel=0)
+        if segments:
+            y_full = np.concatenate([s['y'] for s in segments]); x_full = np.arange(len(y_full)); series = pd.Series(y_full)
+            for sma in self.toolbar.smas:
+                if sma['chk'].isChecked(): val = series.rolling(window=sma['sb'].value()).mean().values; self.plot_widget.plot(x_full, val, pen=pg.mkPen(sma['color'], width=3))
+            if self.toolbar.chk_trend.isChecked(): tr = series.expanding().mean().values; self.plot_widget.plot(x_full, tr, pen=pg.mkPen('#FF9800', width=3))
+            title_txt = f"{self.current_display_title} ({len(y_full)} runs)"; self.state_manager.chart_title_changed.emit(title_txt)
+            self.plot_widget.addItem(pg.InfiniteLine(pos=np.mean(y_full), angle=0, pen=pg.mkPen('#787b86', style=Qt.PenStyle.DashLine))); self.plot_widget.addItem(pg.InfiniteLine(pos=np.percentile(y_full, 75), angle=0, pen=pg.mkPen('#4CAF50', style=Qt.PenStyle.DashLine)))
+        self.date_axis.set_lookup(self.index_to_time_map); self.plot_widget.enableAutoRange()
+
+    # --- PLOT PAYLOAD (With Zero Line) ---
+    def plot_payload(self, payload_list, title=None):
+        self.plot_widget.clear()
+        self.index_to_time_map = {}
+        self.index_to_meta = {} 
+        
+        self.plot_widget.addItem(self.v_line, ignoreBounds=True)
+        self.plot_widget.addItem(self.h_line, ignoreBounds=True)
+        self.plot_widget.addItem(self.label, ignoreBounds=True)
+        if title: self.state_manager.chart_title_changed.emit(title)
+
+        # --- NEW: Explicit Zero Line ---
+        # Solid, same color as text, slightly distinct from grid
+        zero_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen('#d1d4dc', width=1, style=Qt.PenStyle.SolidLine))
+        # Ensure it sits behind data points but above the grid
+        zero_line.setZValue(-5) 
+        self.plot_widget.addItem(zero_line)
+        # -------------------------------
+
+        global_max_y = 0
+        all_points = []
+        for item in payload_list:
+            if not item.get('data'): continue
+            all_points.extend(item['data'])
+            
+        all_points.sort(key=lambda p: p['time'])
+        time_to_index = {p['time']: i for i, p in enumerate(all_points)}
+        
+        for t, i in time_to_index.items():
+            self.index_to_time_map[i] = t
+            
+        for item in payload_list:
+            if not item.get('data'): continue
+            for p in item['data']:
+                if 'meta' in p:
+                    idx = time_to_index[p['time']]
+                    self.index_to_meta[idx] = p['meta']
+
+        for item in payload_list:
+            if not item.get('data'): continue
+            
+            valid_points = [p for p in item['data'] if not np.isnan(p['value'])]
+            if not valid_points: continue
+
+            y = [p['value'] for p in valid_points]
+            if y: global_max_y = max(global_max_y, max(y))
+            x = [time_to_index[p['time']] for p in valid_points]
+            
+            color = item.get('color', '#FFF')
+            width = item.get('width', 2)
+            pen = pg.mkPen(color, width=width)
+            symbol = 'o' if width < 3 else None
+            
+            brush = None
+            if item.get('filled', False):
+                c = QColor(color); c.setAlpha(50)
+                brush = pg.mkBrush(c)
+                
+            self.plot_widget.plot(x, y, pen=pen, symbol=symbol, symbolBrush=color, symbolSize=5, brush=brush, fillLevel=0 if brush else None)
+            
+            if item.get('fill_negative', False):
+                y_arr = np.array(y); y_neg = np.copy(y_arr); y_neg[y_neg > 0] = 0
+                neg_col = QColor(255, 0, 0, 50)
+                self.plot_widget.plot(x, y_neg, pen=None, brush=pg.mkBrush(neg_col), fillLevel=0)
+
+            # Markers (Labels) - kept for compatibility if needed, though we moved to tooltips
+            if item.get('markers'):
+                for m in item['markers']:
+                    m_time = m['time']
+                    if m_time in time_to_index:
+                        idx = time_to_index[m_time]
+                        # Find matching Y value
+                        val = next((p['value'] for p in item['data'] if p['time'] == m_time), 0)
+                        
+                        self.plot_widget.addItem(pg.InfiniteLine(pos=idx, angle=90, pen=pg.mkPen('#363a45', width=1)))
+                        t = pg.TextItem(text=m.get('text',''), color=m.get('color'), anchor=(0,0.5), angle=-90)
+                        t.setPos(idx, val + (global_max_y * 0.05))
+                        self.plot_widget.addItem(t)
+
+        self.date_axis.set_lookup(self.index_to_time_map)
+        self.plot_widget.enableAutoRange()
+--- END OF FILE: modules\charts\chart_widget.py ---
+
+--- START OF FILE: modules\charts\indicators.py ---
+# Plugins for Graph Lines
+
+class IndicatorBase:
+    name = "Base"
+    color = "#FFFFFF"
+    width = 2
+    style = "Solid" # Solid, Dotted, Dashed
+
+    def extract_data(self, processed_session_data):
+        """
+        Takes the list of dicts output by engine.analyze_session
+        Returns a list of {time, value} for TradingView
+        """
+        return []
+
+# --- IMPLEMENTATIONS ---
+
+class IndScore(IndicatorBase):
+    name = "Score"
+    color = "#4aa3df" # Light Blue
+    width = 2
+    def extract_data(self, data):
+        return [{'time': d['time'], 'value': d['pct']} for d in data]
+
+class IndTrend(IndicatorBase):
+    name = "Session Trend"
+    color = "#FF9800" # Orange
+    width = 2
+    def extract_data(self, data):
+        return [{'time': d['time'], 'value': d['trend_pct']} for d in data]
+
+class IndFlow(IndicatorBase):
+    name = "Global Flow"
+    color = "#9C27B0" # Purple
+    width = 2
+    def extract_data(self, data):
+        return [{'time': d['time'], 'value': d['flow_pct']} for d in data]
+
+class IndPulse(IndicatorBase):
+    name = "The Pulse"
+    color = "#00E5FF" # Cyan
+    width = 1
+    def extract_data(self, data):
+        return [{'time': d['time'], 'value': d['pulse_pct']} for d in data]
+
+# Registry
+AVAILABLE_INDICATORS = [IndTrend, IndFlow, IndPulse]
+--- END OF FILE: modules\charts\indicators.py ---
+
+--- START OF FILE: modules\dashboard\grid_container.py ---
+from PyQt6.QtWidgets import (QTabWidget, QTabBar, QMenu, QWidget, QVBoxLayout, 
+                             QPushButton, QToolButton)
+from PyQt6.QtCore import Qt, QPoint, QTimer
+from PyQt6.QtGui import QAction, QCursor
+from modules.dashboard.grid_widget import GridWidget
+
+class GridContainer(QTabWidget):
+    def __init__(self, state_manager, config_manager):
+        super().__init__()
+        self.state_manager = state_manager
+        self.config_manager = config_manager
+        self.all_runs_df = None
+        self.tabs_to_restore = [] # Queue for async restore
+
+        self.setTabsClosable(True)
+        self.setMovable(True)
+        self.setDocumentMode(True)
+        
+        self.tabCloseRequested.connect(self.close_tab_request)
+        self.currentChanged.connect(self.on_tab_changed, Qt.ConnectionType.QueuedConnection)
+        
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+        
+        self.btn_clear = QToolButton()
+        self.btn_clear.setText("Clear Unpinned")
+        self.btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear.clicked.connect(self.close_all_unpinned)
+        self.btn_clear.setStyleSheet("border: none; color: #787b86; font-weight: bold; padding: 2px 8px;")
+        self.setCornerWidget(self.btn_clear, Qt.Corner.TopRightCorner)
+
+        self.state_manager.data_updated.connect(self.on_data_updated)
+        self.state_manager.scenario_selected.connect(self.open_scenario_tab)
+
+        self.setStyleSheet("""
+            QTabBar::tab { background: #1e222d; color: #787b86; padding: 8px 15px; border-right: 1px solid #363a45; border-top: 2px solid transparent; min-width: 120px; }
+            QTabBar::tab:selected { background: #131722; color: #d1d4dc; border-top: 2px solid #2962FF; }
+            QTabBar::tab:hover { background: #2a2e39; }
+            QTabWidget::pane { border: none; background: #131722; }
+        """)
+
+    def on_data_updated(self, df):
+        self.all_runs_df = df
+        for i in range(self.count()):
+            widget = self.widget(i)
+            if isinstance(widget, GridWidget): widget.on_data_updated(df)
+
+    def on_tab_changed(self, index):
+        if index == -1: return
+        widget = self.widget(index)
+        if isinstance(widget, GridWidget):
+            tab_text = self.tabText(index).replace("★ ", "")
+            self.state_manager.scenario_selected.emit(tab_text)
+
+    def open_scenario_tab(self, scenario_name):
+        for i in range(self.count()):
+            clean_name = self.tabText(i).replace("★ ", "")
+            if clean_name == scenario_name:
+                if self.currentIndex() != i: self.setCurrentIndex(i)
+                return
+        
+        # Don't create the tab directly. Create the widget, then add.
+        self._create_and_add_tab({"name": scenario_name, "pinned": False, "active": True})
+
+    def close_tab_request(self, index):
+        if self.is_pinned(index): return 
+        widget = self.widget(index); self.removeTab(index); widget.deleteLater()
+
+    def close_all_unpinned(self):
+        for i in range(self.count() - 1, -1, -1):
+            if not self.is_pinned(i): self.close_tab_request(i)
+
+    def is_pinned(self, index): return self.tabBar().tabData(index) is True
+
+    def toggle_pin(self, index):
+        new_state = not self.is_pinned(index)
+        self.tabBar().setTabData(index, new_state)
+        text = self.tabText(index)
+        if new_state: self.setTabText(index, "★ " + text); self.tabBar().setTabButton(index, QTabBar.ButtonPosition.RightSide, None)
+        else: self.setTabText(index, text.replace("★ ", ""))
+
+    def show_context_menu(self, pos):
+        tab_bar = self.tabBar();
+        if not tab_bar.geometry().contains(pos): return
+        local_pos = tab_bar.mapFrom(self, pos); index = tab_bar.tabAt(local_pos)
+        if index == -1: return
+        menu = QMenu(self)
+        pinned = self.is_pinned(index)
+        menu.addAction("Unpin Tab" if pinned else "Pin Tab").triggered.connect(lambda: self.toggle_pin(index))
+        menu.addSeparator()
+        action_close = menu.addAction("Close"); action_close.setEnabled(not pinned); action_close.triggered.connect(lambda: self.close_tab_request(index))
+        menu.addAction("Close Other Tabs").triggered.connect(lambda: self.close_others(index))
+        menu.addAction("Close All Unpinned").triggered.connect(self.close_all_unpinned)
+        menu.exec(QCursor.pos())
+
+    def close_others(self, keep_index):
+        for i in range(self.count() - 1, -1, -1):
+            if i != keep_index and not self.is_pinned(i): self.close_tab_request(i)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            tab_bar = self.tabBar(); local_pos = tab_bar.mapFrom(self, event.pos()); index = tab_bar.tabAt(local_pos)
+            if index != -1: self.close_tab_request(index); return
+        super().mousePressEvent(event)
+
+    def save_state(self):
+        tabs = []
+        for i in range(self.count()):
+            tabs.append({"name": self.tabText(i).replace("★ ", ""), "pinned": self.is_pinned(i), "active": (i == self.currentIndex())})
+        self.config_manager.set_global("open_tabs", tabs)
+
+    # --- ASYNC RESTORE LOGIC ---
+    def restore_state(self):
+        tabs = self.config_manager.get("open_tabs", default=[])
+        if not tabs: return
+        
+        # Don't create tabs directly, queue them for async creation
+        self.tabs_to_restore = tabs
+        QTimer.singleShot(0, self._restore_next_tab)
+
+    def _restore_next_tab(self):
+        if not self.tabs_to_restore: return # All done
+        
+        tab_data = self.tabs_to_restore.pop(0) # Get next tab from queue
+        
+        # Duplicate check
+        current_names = {self.tabText(i).replace("★ ", "") for i in range(self.count())}
+        if tab_data['name'] in current_names:
+            # Still schedule next one
+            QTimer.singleShot(0, self._restore_next_tab)
+            return
+
+        self._create_and_add_tab(tab_data)
+        
+        # Schedule the next tab creation
+        QTimer.singleShot(50, self._restore_next_tab) # 50ms delay to let UI breathe
+
+    def _create_and_add_tab(self, tab_data):
+        new_grid = GridWidget(self.state_manager, self.config_manager)
+        if self.all_runs_df is not None:
+            new_grid.on_data_updated(self.all_runs_df)
+            
+        new_grid.on_scenario_selected(tab_data['name'])
+        
+        self.blockSignals(True)
+        index = self.addTab(new_grid, tab_data['name'])
+        if tab_data.get('pinned', False): self.toggle_pin(index)
+        if tab_data.get('active', False): self.setCurrentIndex(index)
+        self.blockSignals(False)
+        
+        # If this was the active tab, we need to manually trigger the update
+        if tab_data.get('active', False):
+             self.on_tab_changed(index)
+--- END OF FILE: modules\dashboard\grid_container.py ---
+
